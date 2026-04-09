@@ -16,6 +16,8 @@ model User {
   image             String?
   smartsheetToken   String?
   smartsheetOrgId   String?
+  allowEdits        Boolean   @default(true)
+  allowDeletes      Boolean   @default(true)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
@@ -25,6 +27,7 @@ model User {
   dashboards       Dashboard[]
   stagingRuns      StagingRun[]
   mappingVersions  MappingVersion[]
+  mappingRuns       MappingRun[]
 }
 
 model Account {
@@ -69,6 +72,7 @@ model Mapping {
   slug                String    @unique
   smartsheetSheetId   String?
   smartsheetSheetName String?
+  autoPush            Boolean   @default(false)
   currentVersionId    String?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
@@ -76,6 +80,7 @@ model Mapping {
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   versions        MappingVersion[]
   stagingRuns     StagingRun[]
+  mappingRuns     MappingRun[]
 }
 
 model MappingVersion {
@@ -92,8 +97,33 @@ model MappingVersion {
   mapping     Mapping      @relation(fields: [mappingId], references: [id], onDelete: Cascade)
   user        User         @relation(fields: [userId], references: [id])
   stagingRuns StagingRun[]
+  mappingRuns MappingRun[]
 
   @@unique([mappingId, versionNumber])
+}
+
+model MappingRun {
+  id            String    @id @default(cuid())
+  mappingId     String
+  mappingVersionId String
+  userId        String
+  direction     String    @default("excel_to_excel")
+  inputFileName String?
+  inputData     Json?
+  outputData    Json      // The mapped data
+  changeSet     Json?
+  changedColumns Json?
+  changedCellCount Int?   @default(0)
+  changedRowCount Int?    @default(0)
+  rowCount      Int
+  createdAt     DateTime  @default(now())
+
+  mapping     Mapping        @relation(fields: [mappingId], references: [id], onDelete: Cascade)
+  mappingVersion MappingVersion @relation(fields: [mappingVersionId], references: [id])
+  user        User           @relation(fields: [userId], references: [id])
+
+  @@index([mappingId])
+  @@index([createdAt])
 }
 
 model StagingRun {
@@ -119,15 +149,31 @@ model StagingRun {
 }
 
 model Dashboard {
-  id        String   @id @default(cuid())
-  userId    String
-  name      String
-  slug      String   @unique
-  excelData Json?
-  charts    Json     @default("[]")
-  layout    Json     @default("[]")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  slug        String   @unique
+  excelData   Json?    // Legacy: single sheet data
+  dataSources Json     @default("[]") // Multiple sheets from Excel/Smartsheet
+  charts      Json     @default("[]")
+  layout      Json     @default("[]")
+  linkedMappings Json @default("[]") // Array of {mappingId, autoUpdate}
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model DashboardDataSource {
+  id            String   @id @default(cuid())
+  dashboardId   String
+  name          String   // Sheet name
+  type          String   // "excel" | "smartsheet"
+  sourceId      String?  // Smartsheet sheet ID if applicable
+  columns       Json     // Column metadata
+  rowCount      Int
+  lastRefreshed DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@index([dashboardId])
 }

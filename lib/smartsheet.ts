@@ -3,6 +3,7 @@ export interface SmartsheetColumn {
   title: string;
   type: string;
   index: number;
+  formula?: string;
 }
 
 export interface SmartsheetSheet {
@@ -15,7 +16,18 @@ export interface SmartsheetSheet {
 
 export interface SmartsheetRow {
   id: number;
-  cells: { columnId: number; value: string | number | boolean | null; displayValue?: string }[];
+  rowNumber?: number;
+  parentId?: number;
+  siblingId?: number;
+  expanded?: boolean;
+  locked?: boolean;
+  cells: {
+    columnId: number;
+    value: string | number | boolean | null;
+    displayValue?: string;
+    formula?: string;
+    locked?: boolean;
+  }[];
 }
 
 const SS_BASE = "https://api.smartsheet.com/2.0";
@@ -57,6 +69,7 @@ export async function getSheet(token: string, sheetId: string): Promise<Smartshe
       title: c.title,
       type: c.type,
       index: i,
+      formula: typeof c.formula === "string" ? c.formula : undefined,
     })),
     rowCount: (data.rows || []).length,
     permalink: data.permalink || "",
@@ -67,10 +80,17 @@ export async function getSheetRows(token: string, sheetId: string): Promise<Smar
   const data = await ssRequest(token, `/sheets/${sheetId}`);
   return (data.rows || []).map((r: Record<string, unknown>) => ({
     id: r.id,
+    rowNumber: typeof r.rowNumber === "number" ? r.rowNumber : undefined,
+    parentId: typeof r.parentId === "number" ? r.parentId : undefined,
+    siblingId: typeof r.siblingId === "number" ? r.siblingId : undefined,
+    expanded: typeof r.expanded === "boolean" ? r.expanded : undefined,
+    locked: typeof r.locked === "boolean" ? r.locked : undefined,
     cells: ((r.cells as Record<string, unknown>[] | undefined) || []).map((c: Record<string, unknown>) => ({
       columnId: c.columnId,
       value: c.value ?? null,
       displayValue: c.displayValue,
+      formula: typeof c.formula === "string" ? c.formula : undefined,
+      locked: typeof c.locked === "boolean" ? c.locked : undefined,
     })),
   }));
 }

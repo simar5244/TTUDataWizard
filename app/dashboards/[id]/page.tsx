@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { AppShell } from "@/components/AppShell";
-import { DashboardBuilder } from "@/components/dashboard/DashboardBuilder";
+import { DashboardBuilder, type DataSource } from "@/components/dashboard/DashboardBuilder";
 import { Loader2 } from "lucide-react";
 
 interface DashboardData {
@@ -12,6 +12,7 @@ interface DashboardData {
   slug: string;
   userId: string;
   excelData: unknown;
+  dataSources: DataSource[];
   charts: unknown[];
   layout: unknown[];
 }

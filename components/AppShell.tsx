@@ -19,7 +19,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const { data: session } = useSession();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
 
   return (
     <div className="flex h-screen bg-[#F9F9F9] overflow-hidden">
@@ -31,22 +31,35 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           mobileOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
         )}
       >
-        {/* Logo */}
-        <div className={cn("flex h-16 items-center gap-2 border-b border-[#E5E5E5]", collapsed ? "px-4 justify-between" : "px-5")}>
-          <div className="flex shrink-0 items-center gap-2">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-black">
-              <Zap className="h-4 w-4 text-white" />
-            </div>
-            {!collapsed && <span className="text-[15px] font-semibold tracking-tight">DataWizard</span>}
+        {/* Logo / Toggle */}
+        {collapsed ? (
+          <div className="flex h-16 items-center justify-center border-b border-[#E5E5E5]">
+            <button
+              onClick={() => setCollapsed(false)}
+              className="hidden rounded p-1.5 hover:bg-[#F5F5F5] md:flex"
+              title="Expand sidebar"
+            >
+              <ChevronsRight className="h-4 w-4 text-[#A1A1A1]" />
+            </button>
           </div>
-          <button
-            onClick={() => setCollapsed((c) => !c)}
-            className="hidden rounded p-1 hover:bg-[#F5F5F5] md:flex"
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          >
-            {collapsed ? <ChevronsRight className="h-4 w-4 text-[#A1A1A1]" /> : <ChevronsLeft className="h-4 w-4 text-[#A1A1A1]" />}
-          </button>
-        </div>
+        ) : (
+          <div className="flex h-16 items-center gap-2 border-b border-[#E5E5E5] px-5">
+            <div className="flex shrink-0 items-center gap-2">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-black">
+                <Zap className="h-4 w-4 text-white" />
+              </div>
+              <span className="text-[15px] font-semibold tracking-tight">DataWizard</span>
+            </div>
+            <div className="flex-1" />
+            <button
+              onClick={() => setCollapsed(true)}
+              className="hidden rounded p-1 hover:bg-[#F5F5F5] md:flex"
+              title="Collapse sidebar"
+            >
+              <ChevronsLeft className="h-4 w-4 text-[#A1A1A1]" />
+            </button>
+          </div>
+        )}
 
         {/* Nav */}
         <nav className="flex flex-1 flex-col gap-1 p-3">

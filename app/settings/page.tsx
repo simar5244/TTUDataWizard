@@ -6,6 +6,7 @@ import { AppShell } from "@/components/AppShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
@@ -18,12 +19,40 @@ export default function SettingsPage() {
   const [ssUser, setSsUser] = useState<{ name?: string; email?: string } | null>(null);
   const [ssLoading, setSsLoading] = useState(false);
   const [checkingStatus, setCheckingStatus] = useState(true);
+  const [allowEdits, setAllowEdits] = useState(true);
+  const [allowDeletes, setAllowDeletes] = useState(true);
+  const [securitySaving, setSecuritySaving] = useState(false);
 
   useEffect(() => {
     fetch("/api/settings/smartsheet")
       .then((r) => r.json())
-      .then((d) => { setSsConnected(d.connected); setCheckingStatus(false); });
+      .then((d) => {
+        setSsConnected(d.connected);
+        setAllowEdits(typeof d.allowEdits === "boolean" ? d.allowEdits : true);
+        setAllowDeletes(typeof d.allowDeletes === "boolean" ? d.allowDeletes : true);
+        setCheckingStatus(false);
+      });
   }, []);
+
+  async function updateSecurity(next: { allowEdits?: boolean; allowDeletes?: boolean }) {
+    setSecuritySaving(true);
+    try {
+      const res = await fetch("/api/settings/smartsheet", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to update security settings");
+      setAllowEdits(typeof data.allowEdits === "boolean" ? data.allowEdits : allowEdits);
+      setAllowDeletes(typeof data.allowDeletes === "boolean" ? data.allowDeletes : allowDeletes);
+      toast({ title: "Security settings updated" });
+    } catch (e) {
+      toast({ title: "Update failed", description: (e as Error).message, variant: "destructive" });
+    } finally {
+      setSecuritySaving(false);
+    }
+  }
 
   async function connectSmartsheet() {
     if (!ssToken.trim()) return;
@@ -134,16 +163,48 @@ export default function SettingsPage() {
 
         <Separator className="my-6" />
 
-        {/* About */}
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">About DataWizard</CardTitle>
+            <CardTitle className="text-base">Security Controls</CardTitle>
+            <CardDescription className="mt-1">
+              Hard-stop controls for data operations across the app
+            </CardDescription>
           </CardHeader>
-          <CardContent className="text-sm text-[#6B6B6B] space-y-2">
-            <p>Automate Salesforce Excel exports → Smartsheet, with full staging safety.</p>
-            <p className="text-xs">Built with Next.js 14, Prisma, PostgreSQL, React Flow, and shadcn/ui.</p>
+          <CardContent className="space-y-5">
+            <div className="flex items-center justify-between rounded-lg border border-[#E5E5E5] px-4 py-3">
+              <div>
+                <p className="text-sm font-medium">Allow edits</p>
+                <p className="text-xs text-[#6B6B6B]">If off, create/update/run actions are blocked system-wide.</p>
+              </div>
+              <Switch
+                checked={allowEdits}
+                disabled={securitySaving}
+                onCheckedChange={(checked) => {
+                  setAllowEdits(checked);
+                  void updateSecurity({ allowEdits: checked });
+                }}
+              />
+            </div>
+            <div className="flex items-center justify-between rounded-lg border border-[#E5E5E5] px-4 py-3">
+              <div>
+                <p className="text-sm font-medium">Allow deletes</p>
+                <p className="text-xs text-[#6B6B6B]">If off, delete actions are blocked system-wide.</p>
+              </div>
+              <Switch
+                checked={allowDeletes}
+                disabled={securitySaving}
+                onCheckedChange={(checked) => {
+                  setAllowDeletes(checked);
+                  void updateSecurity({ allowDeletes: checked });
+                }}
+              />
+            </div>
+
           </CardContent>
         </Card>
+
+
+
       </div>
     </AppShell>
   );

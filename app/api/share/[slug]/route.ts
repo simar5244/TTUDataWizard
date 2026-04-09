@@ -10,6 +10,7 @@ export async function GET(req: NextRequest, { params }: { params: { slug: string
   if (type === "dashboard") {
     const dashboard = await prisma.dashboard.findFirst({
       where: { slug: params.slug },
+      select: { id: true, name: true, slug: true, userId: true, excelData: true, charts: true, layout: true },
     });
     if (!dashboard) return NextResponse.json({ error: "Dashboard not found" }, { status: 404 });
     return NextResponse.json({ type: "dashboard", data: dashboard });

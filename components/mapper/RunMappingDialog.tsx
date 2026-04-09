@@ -1,10 +1,12 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useEffect, useState, type ChangeEvent } from "react";
 import { useDropzone } from "react-dropzone";
 import { Upload, CheckCircle2, AlertCircle, ArrowRight, Loader2, Download, Table2, Sheet } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
 import { parseExcelFile, validateExcelAgainstFingerprint, type SchemaFingerprint, type ExcelSheet } from "@/lib/excel";
 import { useToast } from "@/hooks/use-toast";
 import type { MappingConnections } from "@/app/mapper/page";
@@ -15,7 +17,16 @@ interface MappingVersion {
   id: string;
   versionNumber: number;
   schemaFingerprint?: unknown;
-  connections?: MappingConnections;
+  connections?: MappingConnections & {
+    meta?: {
+      smartsheetRowPolicy?: {
+        autoSkipFormulaRows?: boolean;
+        autoSkipParentRows?: boolean;
+        excludedRowNumbers?: number[];
+        excludedKeywords?: string[];
+      };
+    };
+  };
   formulas?: Record<string, string>;
 }
 
@@ -23,6 +34,7 @@ interface RunMappingDialogProps {
   mapping: {
     id: string;
     name: string;
+    autoPush?: boolean;
     smartsheetSheetId?: string | null;
     currentVersionId: string | null;
     versions: MappingVersion[];
@@ -34,6 +46,30 @@ interface RunMappingDialogProps {
 type Step = "upload" | "validate" | "approve" | "running" | "done";
 type RunMode = "excel_to_excel" | "excel_to_ss";
 
+interface ChangeCell {
+  row: number;
+  column: string;
+  from: unknown;
+  to: unknown;
+}
+
+interface ChangePreview {
+  changes: ChangeCell[];
+  changedRows: number[];
+  changedColumns: string[];
+  changedCellCount: number;
+  changedRowCount: number;
+}
+
+interface RunOptions {
+  hierarchyAware: boolean;
+  protectFormulaCells: boolean;
+  protectParentSummaryRows: boolean;
+  excludedRowPatterns: string[];
+  columnExcludedRowPatterns: Record<string, string[]>;
+  excludedRowNumbers: number[];
+}
+
 export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogProps) {
   const { toast } = useToast();
   const [step, setStep] = useState<Step>("upload");
@@ -41,6 +77,26 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
   const [parsedSheet, setParsedSheet] = useState<ExcelSheet | null>(null);
   const [validation, setValidation] = useState<ReturnType<typeof validateExcelAgainstFingerprint> | null>(null);
   const [loading, setLoading] = useState(false);
+  const [outputPreviewRows, setOutputPreviewRows] = useState<Record<string, unknown>[]>([]);
+  const [changePreview, setChangePreview] = useState<ChangePreview | null>(null);
+  const [runOptions, setRunOptions] = useState<RunOptions>({
+    hierarchyAware: true,
+    protectFormulaCells: true,
+    protectParentSummaryRows: true,
+    excludedRowPatterns: ["total", "subtotal", "summary"],
+    columnExcludedRowPatterns: {},
+    excludedRowNumbers: [],
+  });
+  const [excludedPatternInput, setExcludedPatternInput] = useState("total, subtotal, summary");
+  const [excludedRowNumberInput, setExcludedRowNumberInput] = useState("");
+  const [columnExclusionInput, setColumnExclusionInput] = useState("");
+  const [lastPolicyDiagnostics, setLastPolicyDiagnostics] = useState<{
+    totalOutputRows?: number;
+    skippedCells?: number;
+    skipByReason?: Record<string, number>;
+    parentRowsDetected?: number;
+    formulaRowsDetected?: number;
+  } | null>(null);
 
   const isExcelToExcel = !mapping.smartsheetSheetId;
   const runMode: RunMode = isExcelToExcel ? "excel_to_excel" : "excel_to_ss";
@@ -48,7 +104,30 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
   const currentVersion = mapping.versions.find((v) => v.id === mapping.currentVersionId) ?? mapping.versions.at(-1);
   const fingerprint = currentVersion?.schemaFingerprint as SchemaFingerprint | undefined;
 
-  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+  const savedRowPolicy = currentVersion?.connections?.meta?.smartsheetRowPolicy;
+
+  useEffect(() => {
+    const policy = savedRowPolicy;
+    if (!policy) return;
+    const excludedKeywords = Array.isArray(policy.excludedKeywords)
+      ? policy.excludedKeywords.filter((k) => typeof k === "string" && k.trim() !== "")
+      : ["total", "subtotal", "summary"];
+    const excludedRowNumbers = Array.isArray(policy.excludedRowNumbers)
+      ? policy.excludedRowNumbers.filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.floor(n))
+      : [];
+
+    setRunOptions((prev) => ({
+      ...prev,
+      protectFormulaCells: policy.autoSkipFormulaRows !== false,
+      protectParentSummaryRows: policy.autoSkipParentRows !== false,
+      excludedRowPatterns: excludedKeywords,
+      excludedRowNumbers,
+    }));
+    setExcludedPatternInput(excludedKeywords.join(", "));
+    setExcludedRowNumberInput(excludedRowNumbers.join(", "));
+  }, [savedRowPolicy]);
+
+  const onDrop = async (acceptedFiles: File[]) => {
     const f = acceptedFiles[0];
     if (!f) return;
     setFile(f);
@@ -65,18 +144,34 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
     }
 
     setParsedSheet(sheet);
+    const previewRows = applyMappingToSheet(sheet);
+    setOutputPreviewRows(previewRows);
+    setChangePreview(buildChangePreview(sheet.data as Record<string, unknown>[], previewRows));
 
     if (!fingerprint) {
       setValidation({ status: "exact", missingColumns: [], remappedColumns: [], extraColumns: [] });
       setStep("approve");
+      if (!isExcelToExcel && mapping.autoPush) {
+        setTimeout(() => {
+          void handleConfirm();
+        }, 0);
+      }
       return;
     }
 
     const result = validateExcelAgainstFingerprint(sheet, fingerprint);
     setValidation(result);
-    if (result.status === "blocked") setStep("validate");
-    else setStep("approve");
-  }, [fingerprint, toast]);
+    if (result.status === "blocked") {
+      setStep("validate");
+    } else {
+      setStep("approve");
+      if (!isExcelToExcel && mapping.autoPush) {
+        setTimeout(() => {
+          void handleConfirm();
+        }, 0);
+      }
+    }
+  };
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -90,46 +185,99 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
 
   function applyMappingToSheet(sheet: ExcelSheet): Record<string, unknown>[] {
     const conns = currentVersion?.connections;
-    if (!conns?.edges?.length || !conns?.nodes?.length) {
-      return sheet.data;
-    }
+    if (!conns?.nodes?.length) return sheet.data;
 
     const nodes = conns.nodes ?? [];
     const edges = conns.edges ?? [];
+    const sourceNodes = nodes.filter((n) => n.type === "excelCol" || n.type === "ssCol");
+    const targetNodes = nodes.filter((n) => n.type === "ssCol");
 
-    return sheet.data.map((row) => {
-      const outRow: Record<string, unknown> = {};
-
-      for (const edge of edges) {
-        const srcNode = nodes.find((n) => n.id === edge.source);
-        const tgtNode = nodes.find((n) => n.id === edge.target);
-        if (!srcNode || !tgtNode) continue;
-
-        const srcLabel = srcNode.data.label ?? "";
-        const tgtLabel = tgtNode.data.label ?? "";
-        const rawVal = row[srcLabel];
-        const formula = edge.data?.formula ?? "";
-
-        if (!formula) {
-          outRow[tgtLabel] = rawVal;
-        } else {
-          try {
-            let expr = formula;
-            nodes
-              .filter((n) => n.type === "excelCol")
-              .forEach((n) => {
-                const colVal = row[n.data.label ?? ""] ?? 0;
-                const safe = String(colVal).replace(/[^0-9.\-]/g, "") || "0";
-                expr = expr.replace(new RegExp(`\\b${n.data.colKey ?? n.data.label}\\b`, "g"), safe);
-              });
-            outRow[tgtLabel] = evaluate(expr);
-          } catch {
-            outRow[tgtLabel] = rawVal;
+    function resolveNodeValue(nodeId: string): unknown {
+      const node = nodes.find((n) => n.id === nodeId);
+      if (!node) return null;
+      if (node.type === "excelCol") return row[node.data.label ?? ""] ?? null;
+      if (node.type === "formula") {
+        const formula = (node.data.formula as string) || "";
+        if (!formula) return null;
+        const scope: Record<string, unknown> = {};
+        sourceNodes.forEach((n) => {
+          const ref = (n.data.colRef as string) || "";
+          const label = (n.data.label as string) || "";
+          if (!ref || !label) return;
+          const value = row[label];
+          if (value === null || value === undefined || value === "") {
+            scope[ref] = 0;
+            return;
           }
+          if (typeof value === "number") {
+            scope[ref] = value;
+            return;
+          }
+          const numeric = Number(value);
+          scope[ref] = Number.isFinite(numeric) && String(value).trim() !== "" ? numeric : String(value);
+        });
+        const normalized = formula.trim().replace(/^=/, "").replace(/\s*&\s*/g, " + ");
+        try {
+          const result = evaluate(normalized, scope);
+          if (result === undefined || result === null) return null;
+          if (typeof result === "number") {
+            return Number.isFinite(result) ? result : null;
+          }
+          return String(result);
+        } catch {
+          return null;
         }
+      }
+      return null;
+    }
+
+    let row: Record<string, string | number | boolean | null> = {};
+    return sheet.data.map((r) => {
+      row = r;
+      const outRow: Record<string, unknown> = {};
+      for (const tgtNode of targetNodes) {
+        const tgtLabel = (tgtNode.data.label as string) ?? "";
+        if (!tgtLabel) continue;
+        const inEdge = edges.find((e) => e.target === tgtNode.id);
+        if (!inEdge) continue;
+        outRow[tgtLabel] = resolveNodeValue(inEdge.source);
       }
       return outRow;
     });
+  }
+
+  function isValueDifferent(a: unknown, b: unknown): boolean {
+    if (a === b) return false;
+    const left = a === null || a === undefined ? "" : String(a).trim();
+    const right = b === null || b === undefined ? "" : String(b).trim();
+    return left !== right;
+  }
+
+  function buildChangePreview(inputRows: Record<string, unknown>[], outputRows: Record<string, unknown>[]): ChangePreview {
+    const changes: ChangeCell[] = [];
+    const changedRows = new Set<number>();
+    const changedColumns = new Set<string>();
+
+    outputRows.forEach((outputRow, rowIdx) => {
+      const inputRow = inputRows[rowIdx] || {};
+      Object.keys(outputRow).forEach((column) => {
+        const from = (inputRow as Record<string, unknown>)[column] ?? null;
+        const to = outputRow[column] ?? null;
+        if (!isValueDifferent(from, to)) return;
+        const rowNumber = rowIdx + 1;
+        changes.push({ row: rowNumber, column, from, to });
+        changedRows.add(rowNumber);
+        changedColumns.add(column);
+      });
+    });
+
+    return {
+      changes,
+      changedRows: Array.from(changedRows).sort((a, b) => a - b),
+      changedColumns: Array.from(changedColumns),
+      changedCellCount: changes.length,
+      changedRowCount: changedRows.size,
+    };
   }
 
   async function handleConfirm() {
@@ -140,7 +288,8 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
     if (runMode === "excel_to_excel") {
       try {
         if (!parsedSheet) throw new Error("No sheet data");
-        const outputRows = applyMappingToSheet(parsedSheet);
+        const outputRows = outputPreviewRows.length ? outputPreviewRows : applyMappingToSheet(parsedSheet);
+        const preview = changePreview ?? buildChangePreview(parsedSheet.data as Record<string, unknown>[], outputRows);
 
         const wb = XLSX.utils.book_new();
         const ws = XLSX.utils.json_to_sheet(outputRows);
@@ -148,7 +297,32 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
         const outName = `${mapping.name.replace(/\s+/g, "_")}_mapped.xlsx`;
         XLSX.writeFile(wb, outName);
 
-        toast({ title: "Download ready!", description: `Saved as ${outName}` });
+        // Save the run to database
+        const currentVersion = mapping.versions.find((v) => v.id === mapping.currentVersionId) ?? mapping.versions.at(-1);
+        if (currentVersion) {
+          const saveRunRes = await fetch(`/api/mappings/${mapping.id}/runs`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              mappingVersionId: currentVersion.id,
+              direction: "excel_to_excel",
+              inputFileName: file.name,
+              inputData: parsedSheet.data,
+              outputData: outputRows,
+              changeSet: preview.changes,
+              changedColumns: preview.changedColumns,
+              changedCellCount: preview.changedCellCount,
+              changedRowCount: preview.changedRowCount,
+              rowCount: outputRows.length,
+            }),
+          });
+          if (!saveRunRes.ok) {
+            const err = await saveRunRes.json().catch(() => ({ error: "Failed to save run history" }));
+            throw new Error(err.error || "Failed to save run history");
+          }
+        }
+
+        toast({ title: "Download ready!", description: `Saved as ${outName}. Run saved to history.` });
         setStep("done");
       } catch (e) {
         toast({ title: "Mapping failed", description: (e as Error).message, variant: "destructive" });
@@ -158,13 +332,66 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
       }
     } else {
       try {
+        const outputRows = outputPreviewRows.length ? outputPreviewRows : (parsedSheet ? applyMappingToSheet(parsedSheet) : []);
+
         const res = await fetch(`/api/mappings/${mapping.id}/staging`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ direction: "excel_to_ss" }),
+          body: JSON.stringify({
+            direction: "excel_to_ss",
+            excelData: parsedSheet?.data ?? null,
+            outputRows,
+            runOptions,
+          }),
         });
         if (!res.ok) throw new Error((await res.json()).error);
-        toast({ title: "Staging run started", description: "Review and merge when ready." });
+        const stagingRun = await res.json();
+        const diffRows = Array.isArray(stagingRun?.diffResult) ? stagingRun.diffResult : [];
+        const diagnostics =
+          stagingRun?.stagingExcelData && typeof stagingRun.stagingExcelData === "object"
+            ? (stagingRun.stagingExcelData as {
+                _rowPolicyDiagnostics?: {
+                  totalOutputRows?: number;
+                  skippedCells?: number;
+                  skipByReason?: Record<string, number>;
+                  parentRowsDetected?: number;
+                  formulaRowsDetected?: number;
+                };
+              })._rowPolicyDiagnostics
+            : null;
+        setLastPolicyDiagnostics(diagnostics ?? null);
+
+        if (mapping.autoPush && stagingRun?.id) {
+          const autoRes = await fetch(`/api/mappings/${mapping.id}/staging/${stagingRun.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              status: "merged",
+              mergeResolution: diffRows,
+              rowsChanged: diffRows.filter((c: { action?: string; resolution?: string }) => c?.action !== "skip" && c?.resolution !== "keep_production").length,
+              conflictCount: diffRows.filter((c: { isConflict?: boolean }) => c?.isConflict).length,
+              mergedAt: new Date().toISOString(),
+            }),
+          });
+          if (!autoRes.ok) throw new Error((await autoRes.json()).error || "Auto push failed");
+          const skipped = diagnostics?.skippedCells ?? 0;
+          toast({
+            title: "Auto push complete",
+            description: skipped > 0
+              ? `Changes pushed. Skipped ${skipped} protected/excluded cell updates.`
+              : "Changes were pushed to production Smartsheet.",
+          });
+          onClose();
+          return;
+        }
+
+        const skipped = diagnostics?.skippedCells ?? 0;
+        toast({
+          title: "Staging run started",
+          description: skipped > 0
+            ? `Review and merge when ready. ${skipped} cell updates are marked skipped by row policy.`
+            : "Review and merge when ready.",
+        });
         onClose();
       } catch (e) {
         toast({ title: "Failed to start run", description: (e as Error).message, variant: "destructive" });
@@ -180,11 +407,25 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
     setFile(null);
     setParsedSheet(null);
     setValidation(null);
+    setOutputPreviewRows([]);
+    setChangePreview(null);
+    setLastPolicyDiagnostics(null);
+    setRunOptions({
+      hierarchyAware: true,
+      protectFormulaCells: true,
+      protectParentSummaryRows: true,
+      excludedRowPatterns: ["total", "subtotal", "summary"],
+      columnExcludedRowPatterns: {},
+      excludedRowNumbers: [],
+    });
+    setExcludedPatternInput("total, subtotal, summary");
+    setExcludedRowNumberInput("");
+    setColumnExclusionInput("");
   }
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) { reset(); onClose(); } }}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="max-h-[90vh] w-[95vw] max-w-lg overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Run mapping: {mapping.name}</DialogTitle>
         </DialogHeader>
@@ -194,7 +435,7 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
           {runMode === "excel_to_excel" ? (
             <><Table2 className="h-4 w-4 text-[#6B6B6B]" /><span className="text-xs text-[#6B6B6B]">Excel → Excel (download transformed file)</span></>
           ) : (
-            <><Sheet className="h-4 w-4 text-[#6B6B6B]" /><span className="text-xs text-[#6B6B6B]">Excel → Smartsheet (creates staging copy)</span></>
+            <><Sheet className="h-4 w-4 text-[#6B6B6B]" /><span className="text-xs text-[#6B6B6B]">Excel → Smartsheet (staged review, no sheet copy)</span></>
           )}
         </div>
 
@@ -276,6 +517,153 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
               </p>
             )}
 
+            {changePreview && (
+              <div className="space-y-3 rounded-lg border border-[#E5E5E5] p-3">
+                <p className="text-xs font-medium">Run impact preview</p>
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div className="rounded-md bg-amber-50 px-2 py-1 text-amber-800">{changePreview.changedCellCount} cells changing</div>
+                  <div className="rounded-md bg-blue-50 px-2 py-1 text-blue-800">{changePreview.changedRowCount} rows impacted</div>
+                  <div className="rounded-md bg-emerald-50 px-2 py-1 text-emerald-800">{changePreview.changedColumns.length} columns impacted</div>
+                </div>
+                {changePreview.changedCellCount > 0 ? (
+                  <div className="max-h-48 overflow-auto rounded-md border border-[#F0F0F0]">
+                    <table className="w-full text-xs">
+                      <thead className="sticky top-0 bg-[#F9F9F9]">
+                        <tr className="border-b border-[#E5E5E5]">
+                          <th className="px-2 py-1 text-left text-[#6B6B6B]">Row</th>
+                          <th className="px-2 py-1 text-left text-[#6B6B6B]">Column</th>
+                          <th className="px-2 py-1 text-left text-[#6B6B6B]">Current</th>
+                          <th className="px-2 py-1 text-center text-[#6B6B6B]"><ArrowRight className="inline h-3 w-3" /></th>
+                          <th className="px-2 py-1 text-left text-[#6B6B6B]">New</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {changePreview.changes.slice(0, 200).map((c, i) => (
+                          <tr key={`${c.row}-${c.column}-${i}`} className="border-b border-[#F5F5F5] bg-amber-50/40">
+                            <td className="px-2 py-1 font-medium">{c.row}</td>
+                            <td className="px-2 py-1">{c.column}</td>
+                            <td className="px-2 py-1 font-mono text-[#6B6B6B]">{String(c.from ?? "")}</td>
+                            <td className="px-2 py-1 text-center text-[#A1A1A1]">→</td>
+                            <td className="px-2 py-1 font-mono font-semibold">{String(c.to ?? "")}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-xs text-[#6B6B6B]">No cell changes detected for this run.</p>
+                )}
+              </div>
+            )}
+
+            {runMode === "excel_to_ss" && (
+              <div className="space-y-3 rounded-lg border border-[#E5E5E5] p-3">
+                <p className="text-xs font-medium">Smartsheet safety options</p>
+                {lastPolicyDiagnostics && (
+                  <div className="rounded-md border border-[#EFEFEF] bg-[#FAFAFA] px-3 py-2 text-[11px] text-[#5A5A5A]">
+                    <div>Last run diagnostics: analyzed <span className="font-medium text-black">{lastPolicyDiagnostics.totalOutputRows ?? 0}</span> rows, skipped <span className="font-medium text-black">{lastPolicyDiagnostics.skippedCells ?? 0}</span> cell updates.</div>
+                    <div>Detected parent rows: <span className="font-medium text-black">{lastPolicyDiagnostics.parentRowsDetected ?? 0}</span>, formula rows: <span className="font-medium text-black">{lastPolicyDiagnostics.formulaRowsDetected ?? 0}</span>.</div>
+                  </div>
+                )}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <div>
+                      <p className="text-xs font-medium">Hierarchy-aware mode</p>
+                      <p className="text-[11px] text-[#6B6B6B]">Detect parent/child sections and include section context in diff.</p>
+                    </div>
+                    <Switch
+                      checked={runOptions.hierarchyAware}
+                      onCheckedChange={(checked) => setRunOptions((prev) => ({ ...prev, hierarchyAware: checked }))}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <div>
+                      <p className="text-xs font-medium">Protect formula cells</p>
+                      <p className="text-[11px] text-[#6B6B6B]">Skip cells that already contain Smartsheet formulas.</p>
+                    </div>
+                    <Switch
+                      checked={runOptions.protectFormulaCells}
+                      onCheckedChange={(checked) => setRunOptions((prev) => ({ ...prev, protectFormulaCells: checked }))}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <div>
+                      <p className="text-xs font-medium">Protect parent/summary rows</p>
+                      <p className="text-[11px] text-[#6B6B6B]">Skip rows that act as rollups/section headers.</p>
+                    </div>
+                    <Switch
+                      checked={runOptions.protectParentSummaryRows}
+                      onCheckedChange={(checked) => setRunOptions((prev) => ({ ...prev, protectParentSummaryRows: checked }))}
+                    />
+                  </div>
+                  <div className="space-y-2 rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <p className="text-xs font-medium">Exclude rows by keyword</p>
+                    <p className="text-[11px] text-[#6B6B6B]">Skip destination rows whose path/title contains these tokens.</p>
+                    <Input
+                      value={excludedPatternInput}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value;
+                        setExcludedPatternInput(raw);
+                        const patterns = raw
+                          .split(",")
+                          .map((s: string) => s.trim().toLowerCase())
+                          .filter(Boolean);
+                        setRunOptions((prev) => ({ ...prev, excludedRowPatterns: patterns }));
+                      }}
+                      placeholder="total, subtotal, summary"
+                    />
+                  </div>
+                  <div className="space-y-2 rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <p className="text-xs font-medium">Exclude destination row numbers</p>
+                    <p className="text-[11px] text-[#6B6B6B]">Rows are skipped in-place; source order is preserved.</p>
+                    <Input
+                      value={excludedRowNumberInput}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value;
+                        setExcludedRowNumberInput(raw);
+                        const rows = raw
+                          .split(",")
+                          .map((s: string) => Number(s.trim()))
+                          .filter((n) => Number.isFinite(n) && n > 0)
+                          .map((n) => Math.floor(n));
+                        setRunOptions((prev) => ({ ...prev, excludedRowNumbers: rows }));
+                      }}
+                      placeholder="8, 18, 32"
+                    />
+                  </div>
+                  <div className="space-y-2 rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <p className="text-xs font-medium">Column-specific row exclusion</p>
+                    <p className="text-[11px] text-[#6B6B6B]">Format: <code>Column A=total|summary; Column B=capstone</code></p>
+                    <Input
+                      value={columnExclusionInput}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value;
+                        setColumnExclusionInput(raw);
+                        const mapping: Record<string, string[]> = {};
+                        raw
+                          .split(";")
+                          .map((s: string) => s.trim())
+                          .filter(Boolean)
+                          .forEach((rule: string) => {
+                            const [colPart, patternPart] = rule.split("=");
+                            const colName = (colPart || "").trim();
+                            const patterns = (patternPart || "")
+                              .split("|")
+                              .map((p: string) => p.trim().toLowerCase())
+                              .filter(Boolean);
+                            if (colName && patterns.length > 0) {
+                              mapping[colName] = patterns;
+                            }
+                          });
+                        setRunOptions((prev) => ({ ...prev, columnExcludedRowPatterns: mapping }));
+                      }}
+                      placeholder="2023 Totals=total|summary; April 2024=subtotal"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-2">
               <Button variant="outline" onClick={reset} className="flex-1">Change file</Button>
               <Button onClick={handleConfirm} className="flex-1" disabled={loading}>
@@ -301,8 +689,8 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-green-50">
               <Download className="h-6 w-6 text-green-600" />
             </div>
-            <p className="text-sm font-medium">Mapping applied successfully!</p>
-            <p className="text-xs text-[#6B6B6B]">Your file was downloaded to your default downloads folder.</p>
+            <p className="text-sm font-medium">Mapping applied &amp; downloaded!</p>
+            <p className="text-xs text-[#6B6B6B]">Check your <strong>Downloads</strong> folder — the file is saved as <code className="font-mono text-[10px] bg-[#F5F5F5] px-1 rounded">{mapping.name.replace(/\s+/g, "_")}_mapped.xlsx</code>.</p>
             <div className="mt-2 flex gap-2">
               <Button variant="outline" onClick={reset}>Run again</Button>
               <Button onClick={onClose}>Done</Button>

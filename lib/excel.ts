@@ -104,7 +104,11 @@ export function validateExcelAgainstFingerprint(
   fingerprint: SchemaFingerprint
 ): ValidationResult {
   const uploadedHeaders = sheet.columns.map((c) => c.header);
-  const expectedHeaders = fingerprint.columnNames;
+  const expectedHeaders = Array.isArray(fingerprint.columnNames)
+    ? fingerprint.columnNames
+    : Array.isArray(fingerprint.columnOrder)
+      ? fingerprint.columnOrder
+      : [];
 
   const missingColumns: string[] = [];
   const remappedColumns: ValidationResult["remappedColumns"] = [];
@@ -113,7 +117,9 @@ export function validateExcelAgainstFingerprint(
   for (const expected of expectedHeaders) {
     const exactIdx = uploadedHeaders.indexOf(expected);
     if (exactIdx !== -1) {
-      const originalIdx = fingerprint.columnOrder.indexOf(expected);
+      const originalIdx = Array.isArray(fingerprint.columnOrder)
+        ? fingerprint.columnOrder.indexOf(expected)
+        : expectedHeaders.indexOf(expected);
       if (originalIdx !== exactIdx) {
         remappedColumns.push({
           expected,
@@ -130,7 +136,9 @@ export function validateExcelAgainstFingerprint(
         remappedColumns.push({
           expected,
           found: uploadedHeaders[caseInsensitiveIdx],
-          fromIndex: fingerprint.columnOrder.indexOf(expected),
+            fromIndex: Array.isArray(fingerprint.columnOrder)
+              ? fingerprint.columnOrder.indexOf(expected)
+              : expectedHeaders.indexOf(expected),
           toIndex: caseInsensitiveIdx,
         });
       } else {

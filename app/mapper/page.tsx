@@ -13,7 +13,15 @@ import { RunMappingDialog } from "@/components/mapper/RunMappingDialog";
 export interface MappingNode {
   id: string;
   type: string;
-  data: { label?: string; colKey?: string; colId?: string };
+  data: {
+    label?: string;
+    colKey?: string;
+    colId?: string;
+    colRef?: string;
+    formula?: string;
+    leftInputs?: { id: string; label: string; colRef?: string }[];
+    rightInputs?: { id: string; label: string; colRef?: string }[];
+  };
 }
 export interface MappingEdge {
   id: string;
@@ -24,12 +32,21 @@ export interface MappingEdge {
 export interface MappingConnections {
   nodes?: MappingNode[];
   edges?: MappingEdge[];
+  meta?: {
+    smartsheetRowPolicy?: {
+      autoSkipFormulaRows?: boolean;
+      autoSkipParentRows?: boolean;
+      excludedRowNumbers?: number[];
+      excludedKeywords?: string[];
+    };
+  };
 }
 
 interface MappingItem {
   id: string;
   name: string;
   slug: string;
+  autoPush?: boolean;
   updatedAt: string;
   createdAt: string;
   smartsheetSheetId: string | null;
@@ -44,6 +61,7 @@ interface MappingItem {
     schemaFingerprint?: unknown;
   }[];
   stagingRuns: { id: string; status: string; createdAt: string }[];
+  mappingRunCount?: number;
 }
 
 export default function MapperPage() {
@@ -56,14 +74,26 @@ export default function MapperPage() {
     fetch("/api/mappings")
       .then((r) => r.json())
       .then((d) => {
-        setMappings(Array.isArray(d) ? d : []);
+        setMappings(
+          Array.isArray(d)
+            ? d.map((m) => ({
+                ...m,
+                autoPush: typeof m.autoPush === "boolean" ? m.autoPush : false,
+              }))
+            : []
+        );
         setLoading(false);
       });
   }, []);
 
   async function deleteMapping(id: string, name: string) {
     if (!confirm(`Delete mapping "${name}"? This cannot be undone.`)) return;
-    await fetch(`/api/mappings/${id}`, { method: "DELETE" });
+    const res = await fetch(`/api/mappings/${id}`, { method: "DELETE" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Delete failed" }));
+      toast({ title: "Delete blocked", description: err.error || "Delete failed", variant: "destructive" });
+      return;
+    }
     setMappings((prev) => prev.filter((m) => m.id !== id));
     toast({ title: "Mapping deleted" });
   }
@@ -134,11 +164,12 @@ export default function MapperPage() {
                       ) : (
                         <span className="text-blue-600">Excel → Excel</span>
                       )}
+                      {m.autoPush && <span className="text-emerald-700">Auto Push</span>}
                       <span className="flex items-center gap-1">
                         <Clock className="h-3 w-3" />
                         Updated {formatDate(m.updatedAt)}
                       </span>
-                      <span>{m.stagingRuns.length} runs</span>
+                      <span>{m.stagingRuns.length + (m.mappingRunCount ?? 0)} runs</span>
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
@@ -186,4 +217,3 @@ export default function MapperPage() {
     </AppShell>
   );
 }
-

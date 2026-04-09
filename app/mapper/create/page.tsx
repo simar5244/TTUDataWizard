@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import { ReactFlowProvider } from "@xyflow/react";
 import { AppShell } from "@/components/AppShell";
 import { MapperWorkspace } from "@/components/mapper/MapperWorkspace";
 
@@ -13,7 +14,9 @@ export default function CreateMapperPage() {
 
   return (
     <AppShell>
-      <MapperWorkspace onSaved={handleSaved} />
+      <ReactFlowProvider>
+        <MapperWorkspace onSaved={handleSaved} />
+      </ReactFlowProvider>
     </AppShell>
   );
 }

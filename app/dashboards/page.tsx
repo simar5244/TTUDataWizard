@@ -29,7 +29,12 @@ export default function DashboardsPage() {
 
   async function deleteDashboard(id: string, name: string) {
     if (!confirm(`Delete dashboard "${name}"?`)) return;
-    await fetch(`/api/dashboards/${id}`, { method: "DELETE" });
+    const res = await fetch(`/api/dashboards/${id}`, { method: "DELETE" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Delete failed" }));
+      toast({ title: "Delete blocked", description: err.error || "Delete failed", variant: "destructive" });
+      return;
+    }
     setDashboards((prev) => prev.filter((d) => d.id !== id));
     toast({ title: "Dashboard deleted" });
   }

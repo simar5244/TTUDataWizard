@@ -41,29 +41,29 @@ function prepareData(chart: ChartConfig, sheet: ExcelSheet) {
     return entry;
   });
 
-  if (chart.aggregation !== "none") {
-    const grouped: Record<string, Record<string, number[]>> = {};
-    rows.forEach((row) => {
-      const key = String(row.name);
-      if (!grouped[key]) grouped[key] = {};
-      yCols.forEach((yc) => {
-        if (!grouped[key][yc.header]) grouped[key][yc.header] = [];
-        grouped[key][yc.header].push(Number(row[yc.header]) || 0);
-      });
+  // Always group by X column to prevent duplicate labels
+  const grouped: Record<string, Record<string, number[]>> = {};
+  rows.forEach((row) => {
+    const key = String(row.name);
+    if (!grouped[key]) grouped[key] = {};
+    yCols.forEach((yc) => {
+      if (!grouped[key][yc.header]) grouped[key][yc.header] = [];
+      grouped[key][yc.header].push(Number(row[yc.header]) || 0);
     });
-    rows = Object.entries(grouped).map(([name, cols]) => {
-      const entry: Record<string, string | number | null> = { name };
-      Object.entries(cols).forEach(([col, vals]) => {
-        const agg = chart.aggregation;
-        if (agg === "sum") entry[col] = vals.reduce((a, b) => a + b, 0);
-        else if (agg === "avg") entry[col] = vals.reduce((a, b) => a + b, 0) / vals.length;
-        else if (agg === "count") entry[col] = vals.length;
-        else if (agg === "min") entry[col] = Math.min(...vals);
-        else if (agg === "max") entry[col] = Math.max(...vals);
-      });
-      return entry;
+  });
+  rows = Object.entries(grouped).map(([name, cols]) => {
+    const entry: Record<string, string | number | null> = { name };
+    Object.entries(cols).forEach(([col, vals]) => {
+      const agg = chart.aggregation;
+      if (agg === "none") entry[col] = vals[0]; // First value when no aggregation
+      else if (agg === "sum") entry[col] = vals.reduce((a, b) => a + b, 0);
+      else if (agg === "avg") entry[col] = vals.reduce((a, b) => a + b, 0) / vals.length;
+      else if (agg === "count") entry[col] = vals.length;
+      else if (agg === "min") entry[col] = Math.min(...vals);
+      else if (agg === "max") entry[col] = Math.max(...vals);
     });
-  }
+    return entry;
+  });
 
   if (chart.limit && chart.limit > 0) rows = rows.slice(0, chart.limit);
   if (chart.sortBy === "asc") rows.sort((a, b) => Number(a[chart.yColumns[0]]) - Number(b[chart.yColumns[0]]));
@@ -91,7 +91,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
   };
 
   const xAxisLabel = chart.xColumn || "";
-  const yAxisLabel = yKeys.length === 1 ? yKeys[0] : "";
+  const yAxisLabel = yKeys.length === 1 ? yKeys[0] : yKeys.length > 1 ? "Value" : "";
   const axisLabelStyle = { fontSize: 10, fill: "#999" };
 
   switch (chart.type) {
@@ -102,7 +102,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
           <BarChart
             {...commonProps}
             layout={chart.type === "bar_horizontal" ? "vertical" : "horizontal"}
-            margin={{ top: 8, right: 12, bottom: xAxisLabel ? 36 : 8, left: yAxisLabel ? 8 : 0 }}
+            margin={{ top: 8, right: 12, bottom: xAxisLabel ? 36 : 8, left: yAxisLabel ? 40 : 16 }}
           >
             {showGrid && <CartesianGrid strokeDasharray="3 3" stroke="#F0F0F0" />}
             {chart.type === "bar_horizontal" ? (
@@ -127,13 +127,13 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
                 />
                 <YAxis
                   tick={{ fontSize: 10 }}
-                  width={50}
-                  label={yAxisLabel ? { value: yAxisLabel, angle: -90, position: "insideLeft", dx: 14, style: axisLabelStyle } : undefined}
+                  width={yAxisLabel ? 70 : 50}
+                  label={yAxisLabel ? { value: yAxisLabel, angle: -90, position: "insideLeft", dx: -10, style: axisLabelStyle } : undefined}
                 />
               </>
             )}
             <Tooltip />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 10 }} />}
+            {showLegend && yKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 10 }} verticalAlign="top" align="right" />}
             {yKeys.map((key, i) => (
               <Bar key={key} dataKey={key} fill={colors[i % colors.length]} stackId={stacked ? "a" : undefined} radius={[2, 2, 0, 0]}>
                 {showLabels && <LabelList dataKey={key} position="top" style={{ fontSize: 9 }} />}
@@ -147,7 +147,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
     case "combo":
       return (
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart {...commonProps} margin={{ top: 8, right: 12, bottom: xAxisLabel ? 36 : 8, left: yAxisLabel ? 8 : 0 }}>
+          <LineChart {...commonProps} margin={{ top: 8, right: 12, bottom: xAxisLabel ? 36 : 8, left: yAxisLabel ? 40 : 16 }}>
             {showGrid && <CartesianGrid strokeDasharray="3 3" stroke="#F0F0F0" />}
             <XAxis
               dataKey="name"
@@ -157,11 +157,11 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
             />
             <YAxis
               tick={{ fontSize: 10 }}
-              width={50}
-              label={yAxisLabel ? { value: yAxisLabel, angle: -90, position: "insideLeft", dx: 14, style: axisLabelStyle } : undefined}
+              width={yAxisLabel ? 70 : 50}
+              label={yAxisLabel ? { value: yAxisLabel, angle: -90, position: "insideLeft", dx: -10, style: axisLabelStyle } : undefined}
             />
             <Tooltip />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 10 }} />}
+            {showLegend && yKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 10 }} verticalAlign="top" align="right" />}
             {yKeys.map((key, i) => (
               <Line key={key} type="monotone" dataKey={key} stroke={colors[i % colors.length]} strokeWidth={chart.strokeWidth ?? 2} dot={false}>
                 {showLabels && <LabelList dataKey={key} position="top" style={{ fontSize: 9 }} />}
@@ -175,7 +175,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
     case "area_stacked":
       return (
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart {...commonProps} margin={{ top: 8, right: 12, bottom: xAxisLabel ? 36 : 8, left: yAxisLabel ? 8 : 0 }}>
+          <AreaChart {...commonProps} margin={{ top: 8, right: 12, bottom: xAxisLabel ? 36 : 8, left: yAxisLabel ? 40 : 16 }}>
             {showGrid && <CartesianGrid strokeDasharray="3 3" stroke="#F0F0F0" />}
             <XAxis
               dataKey="name"
@@ -185,11 +185,11 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
             />
             <YAxis
               tick={{ fontSize: 10 }}
-              width={50}
-              label={yAxisLabel ? { value: yAxisLabel, angle: -90, position: "insideLeft", dx: 14, style: axisLabelStyle } : undefined}
+              width={yAxisLabel ? 70 : 50}
+              label={yAxisLabel ? { value: yAxisLabel, angle: -90, position: "insideLeft", dx: -10, style: axisLabelStyle } : undefined}
             />
             <Tooltip />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 10 }} />}
+            {showLegend && yKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 10 }} verticalAlign="top" align="right" />}
             {yKeys.map((key, i) => (
               <Area
                 key={key}
@@ -226,7 +226,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
               ))}
             </Pie>
             <Tooltip />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 10 }} />}
+            {showLegend && yKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 10 }} verticalAlign="top" align="right" />}
           </PieChart>
         </ResponsiveContainer>
       );
@@ -238,7 +238,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
             <PolarGrid />
             <PolarAngleAxis dataKey="name" tick={{ fontSize: 10 }} />
             <Tooltip />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 10 }} />}
+            {showLegend && yKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 10 }} verticalAlign="top" align="right" />}
             {yKeys.map((key, i) => (
               <Radar key={key} name={key} dataKey={key} stroke={colors[i % colors.length]} fill={colors[i % colors.length]} fillOpacity={0.4} />
             ))}
@@ -256,7 +256,7 @@ export function ChartRenderer({ chart, sheet }: ChartRendererProps) {
               ))}
             </RadialBar>
             <Tooltip />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 10 }} />}
+            {showLegend && yKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 10 }} verticalAlign="top" align="right" />}
           </RadialBarChart>
         </ResponsiveContainer>
       );

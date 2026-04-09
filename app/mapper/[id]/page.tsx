@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { ReactFlowProvider } from "@xyflow/react";
 import { AppShell } from "@/components/AppShell";
 import { MapperWorkspace } from "@/components/mapper/MapperWorkspace";
 import { Loader2 } from "lucide-react";
@@ -9,6 +10,7 @@ import { Loader2 } from "lucide-react";
 interface MappingData {
   id: string;
   name: string;
+  autoPush?: boolean;
   smartsheetSheetId: string | null;
   smartsheetSheetName: string | null;
   currentVersionId: string | null;
@@ -31,7 +33,13 @@ export default function EditMapperPage() {
   useEffect(() => {
     fetch(`/api/mappings/${id}`)
       .then((r) => r.json())
-      .then((d) => { setMapping(d); setLoading(false); });
+      .then((d) => {
+        setMapping({
+          ...d,
+          autoPush: typeof d.autoPush === "boolean" ? d.autoPush : false,
+        });
+        setLoading(false);
+      });
   }, [id]);
 
   if (loading) {
@@ -56,10 +64,12 @@ export default function EditMapperPage() {
 
   return (
     <AppShell>
-      <MapperWorkspace
-        initialMapping={mapping}
-        onSaved={(savedId) => router.push(`/mapper/${savedId}`)}
-      />
+      <ReactFlowProvider>
+        <MapperWorkspace
+          initialMapping={mapping}
+          onSaved={(savedId) => router.push(`/mapper/${savedId}`)}
+        />
+      </ReactFlowProvider>
     </AppShell>
   );
 }
