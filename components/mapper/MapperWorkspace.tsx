@@ -49,6 +49,7 @@ import { useToast } from "@/hooks/use-toast";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { NodeActionsContext } from "@/components/mapper/NodeActionsContext";
+import { mergeSmartsheetTargetNodes } from "@/lib/duplicationmech";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -124,6 +125,11 @@ interface DynamicTargetColumnPolicy {
   nameTemplate: string;
   columnPosition: "start" | "end" | "custom";
   customColumnNumber: number;
+}
+
+interface DuplicateTargetColumnPolicy {
+  duplicateOnRun: boolean;
+  duplicateNameTemplate: string;
 }
 
 interface LinkedSmartsheetMeta {
@@ -301,10 +307,15 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
     customColumnNumber: 1,
   });
   const [showSsSearch, setShowSsSearch] = useState(false);
+  const [selectedSsSheetLoadedOnce, setSelectedSsSheetLoadedOnce] = useState(false);
   const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [addColumnSide, setAddColumnSide] = useState<"left" | "right">("left");
   const [addColumnName, setAddColumnName] = useState("");
   const [instantAddTargetColumn, setInstantAddTargetColumn] = useState(true);
+  const [duplicateTargetColumn, setDuplicateTargetColumn] = useState<DuplicateTargetColumnPolicy>({
+    duplicateOnRun: false,
+    duplicateNameTemplate: "",
+  });
   const [showInputSettings, setShowInputSettings] = useState(false);
   const [showOutputSettings, setShowOutputSettings] = useState(false);
   const [showAddColumnDestinationPolicy, setShowAddColumnDestinationPolicy] = useState(false);
@@ -344,6 +355,10 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
   useEffect(() => {
     setAutoPush(initialMapping?.autoPush ?? false);
   }, [initialMapping?.id, initialMapping?.autoPush]);
+
+  useEffect(() => {
+    setSelectedSsSheetLoadedOnce(false);
+  }, [initialMapping?.id]);
 
   useEffect(() => {
     if (!initialMapping?.versions?.length) return;
@@ -419,6 +434,7 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
     }
     if (savedLinkedSmartsheet?.id) {
       setSsConnected(true);
+      setSelectedSsSheetLoadedOnce(false);
       setSelectedSsSheet((prev) => prev ?? {
         id: Number(savedLinkedSmartsheet.id),
         name: savedLinkedSmartsheet.name || "Smartsheet",
@@ -448,9 +464,23 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
     if (targetMode !== "smartsheet") return;
     const sheetId = selectedSsSheet?.id || Number(initialMapping?.smartsheetSheetId ?? 0);
     if (!sheetId) return;
-    if (selectedSsSheet && selectedSsSheet.columns.length > 0) return;
+    const currentVersion =
+      initialMapping?.versions?.find((v) => v.id === initialMapping.currentVersionId) ??
+      initialMapping?.versions?.[initialMapping.versions.length - 1];
+    const savedNodes = ((currentVersion?.connections as { nodes?: Node[] } | undefined)?.nodes ?? []) as Node[];
+    const hasSavedTargetNodes = savedNodes.some((node) => node.type === "ssCol");
+    if (hasSavedTargetNodes && !selectedSsSheetLoadedOnce) return;
+    const hasSelectedSheet = Boolean(selectedSsSheet && Number(selectedSsSheet.id) === Number(sheetId));
+    if (hasSelectedSheet && selectedSsSheetLoadedOnce) return;
     void selectSsSheet(String(sheetId));
-  }, [targetMode, selectedSsSheet?.id, selectedSsSheet?.columns.length, initialMapping?.smartsheetSheetId]);
+  }, [
+    targetMode,
+    selectedSsSheet?.id,
+    selectedSsSheetLoadedOnce,
+    initialMapping?.smartsheetSheetId,
+    initialMapping?.currentVersionId,
+    initialMapping?.versions,
+  ]);
 
   useEffect(() => {
     if (!initialMapping?.versions?.length) return;
@@ -459,6 +489,10 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
       initialMapping.versions[initialMapping.versions.length - 1];
     const conns = (currentVersion?.connections as { nodes?: Node[] } | undefined);
     const connNodes = Array.isArray(conns?.nodes) ? (conns?.nodes as Node[]) : [];
+
+    if (connNodes.some((node) => node.type === "ssCol")) {
+      setSelectedSsSheetLoadedOnce(true);
+    }
 
     const sourceNodes = connNodes.filter((n) => n.id.startsWith("excel_"));
     if (sourceNodes.length > 0) {
@@ -876,6 +910,8 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
       synthetic?: boolean;
       columnPosition?: "start" | "end" | "custom";
       customColumnNumber?: number;
+      duplicateOnRun?: boolean;
+      duplicateNameTemplate?: string;
     }
   ) => {
     const id = opts?.colId !== undefined && opts?.colId !== null
@@ -897,6 +933,11 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
           typeof opts?.customColumnNumber === "number" && opts.customColumnNumber > 0
             ? Math.floor(opts.customColumnNumber)
             : 1,
+        duplicateOnRun: opts?.duplicateOnRun === true,
+        duplicateNameTemplate:
+          typeof opts?.duplicateNameTemplate === "string" && opts.duplicateNameTemplate.trim() !== ""
+            ? opts.duplicateNameTemplate.trim()
+            : label,
         nodeId: id,
         onLabelChange: handleLabelChange,
         onTypeChange: handleTypeChange,
@@ -907,8 +948,14 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
   }, [nodes, setNodes, toast, handleLabelChange, handleTypeChange]);
 
   const openAddColumnDialog = useCallback((side: "left" | "right") => {
+    const defaultName = side === "left" ? `Input ${Date.now().toString().slice(-4)}` : `Output ${Date.now().toString().slice(-4)}`;
     setAddColumnSide(side);
-    setAddColumnName(side === "left" ? `Input ${Date.now().toString().slice(-4)}` : `Output ${Date.now().toString().slice(-4)}`);
+    setAddColumnName(defaultName);
+    setInstantAddTargetColumn(true);
+    setDuplicateTargetColumn({
+      duplicateOnRun: false,
+      duplicateNameTemplate: defaultName,
+    });
     setShowAddColumnDestinationPolicy(side === "right" ? dynamicTargetColumn.enabled : false);
     setAddColumnOpen(true);
   }, [dynamicTargetColumn.enabled]);
@@ -969,6 +1016,8 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
           synthetic: false,
           columnPosition: dynamicTargetColumn.columnPosition,
           customColumnNumber: dynamicTargetColumn.customColumnNumber,
+          duplicateOnRun: false,
+          duplicateNameTemplate: String(data?.title ?? resolvedRightLabel),
         });
 
         if (Number.isFinite(createdId)) {
@@ -999,11 +1048,17 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
       addManualTargetColumn(resolvedRightLabel, {
         columnPosition: dynamicTargetColumn.columnPosition,
         customColumnNumber: dynamicTargetColumn.customColumnNumber,
+        duplicateOnRun:
+          targetMode === "smartsheet" &&
+          !instantAddTargetColumn &&
+          duplicateTargetColumn.duplicateOnRun,
+        duplicateNameTemplate:
+          String(duplicateTargetColumn.duplicateNameTemplate || label).trim() || label,
       });
     }
 
     setAddColumnOpen(false);
-  }, [addColumnName, addColumnSide, addManualSourceColumn, addManualTargetColumn, dynamicTargetColumn.columnPosition, dynamicTargetColumn.customColumnNumber, instantAddTargetColumn, nodes, selectedSsSheet?.id, showAddColumnDestinationPolicy, targetMode, toast]);
+  }, [addColumnName, addColumnSide, addManualSourceColumn, addManualTargetColumn, duplicateTargetColumn.duplicateNameTemplate, duplicateTargetColumn.duplicateOnRun, dynamicTargetColumn.columnPosition, dynamicTargetColumn.customColumnNumber, instantAddTargetColumn, nodes, selectedSsSheet?.id, showAddColumnDestinationPolicy, targetMode, toast]);
 
   const onConnect = useCallback(
     (params: Connection) => {
@@ -1233,6 +1288,7 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
       const sheets = await res.json();
       setSsSheets(sheets);
       setSsConnected(true);
+      setSelectedSsSheetLoadedOnce(false);
     } catch (e) {
       toast({ title: "Smartsheet error", description: (e as Error).message, variant: "destructive" });
     } finally {
@@ -1248,13 +1304,43 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
       const res = await fetch(`/api/smartsheet/sheets/${sheetId}`);
       const sheet = await res.json();
       setSelectedSsSheet(sheet);
-      const ssNodes: Node[] = (sheet.columns || []).map((col: SmartsheetColumn, i: number) => ({
-        id: `ss_${col.id}`,
-        type: "ssCol",
-        position: { x: 800, y: 80 + i * 65 },
-        data: { label: col.title, colType: col.type, colId: col.id, colRef: "R" + getColRef(i), index: i, nodeId: `ss_${col.id}`, onLabelChange: handleLabelChange, onTypeChange: handleTypeChange, onDelete: handleDeleteNode },
-      }));
-      setNodes((prev) => [...prev.filter((n) => !n.id.startsWith("ss_")), ...ssNodes]);
+      setSelectedSsSheetLoadedOnce(true);
+      setNodes((prev) => {
+        const merged = mergeSmartsheetTargetNodes({
+          existingNodes: prev,
+          remoteColumns: (sheet.columns || []).map((col: SmartsheetColumn) => ({
+            id: Number(col.id),
+            title: String(col.title),
+            type: String(col.type),
+          })),
+          colRefForIndex: (index) => getColRef(index),
+          onLabelChange: handleLabelChange,
+          onTypeChange: handleTypeChange,
+        });
+
+        if (merged.removedNodeIds.length > 0) {
+          setEdges((prevEdges) =>
+            prevEdges.filter((edge) => !merged.removedNodeIds.includes(String(edge.source)) && !merged.removedNodeIds.includes(String(edge.target)))
+          );
+        }
+
+        if (merged.remappedNodeIds.size > 0) {
+          setEdges((prevEdges) =>
+            prevEdges.map((edge) => {
+              const nextSource = merged.remappedNodeIds.get(String(edge.source));
+              const nextTarget = merged.remappedNodeIds.get(String(edge.target));
+              if (!nextSource && !nextTarget) return edge;
+              return {
+                ...edge,
+                source: nextSource ?? edge.source,
+                target: nextTarget ?? edge.target,
+              };
+            })
+          );
+        }
+
+        return merged.nodes as Node[];
+      });
       toast({ title: "Smartsheet refreshed", description: `${sheet.columns?.length ?? 0} columns loaded` });
     } catch {
       toast({ title: "Refresh failed", variant: "destructive" });
@@ -1271,14 +1357,44 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
         const res = await fetch(`/api/smartsheet/sheets/${sheetId}`);
         const sheet = await res.json();
         setSelectedSsSheet(sheet);
+        setSelectedSsSheetLoadedOnce(true);
         setSsConnected(true);
-        const ssNodes: Node[] = (sheet.columns || []).map((col: SmartsheetColumn, i: number) => ({
-          id: `ss_${col.id}`,
-          type: "ssCol",
-          position: { x: 800, y: 80 + i * 65 },
-          data: { label: col.title, colType: col.type, colId: col.id, colRef: "R" + getColRef(i), index: i, nodeId: `ss_${col.id}`, onLabelChange: handleLabelChange, onTypeChange: handleTypeChange, onDelete: handleDeleteNode },
-        }));
-        setNodes((prev) => [...prev.filter((n) => !n.id.startsWith("ss_")), ...ssNodes]);
+        setNodes((prev) => {
+          const merged = mergeSmartsheetTargetNodes({
+            existingNodes: prev,
+            remoteColumns: (sheet.columns || []).map((col: SmartsheetColumn) => ({
+              id: Number(col.id),
+              title: String(col.title),
+              type: String(col.type),
+            })),
+            colRefForIndex: (index) => getColRef(index),
+            onLabelChange: handleLabelChange,
+            onTypeChange: handleTypeChange,
+          });
+
+          if (merged.removedNodeIds.length > 0) {
+            setEdges((prevEdges) =>
+              prevEdges.filter((edge) => !merged.removedNodeIds.includes(String(edge.source)) && !merged.removedNodeIds.includes(String(edge.target)))
+            );
+          }
+
+          if (merged.remappedNodeIds.size > 0) {
+            setEdges((prevEdges) =>
+              prevEdges.map((edge) => {
+                const nextSource = merged.remappedNodeIds.get(String(edge.source));
+                const nextTarget = merged.remappedNodeIds.get(String(edge.target));
+                if (!nextSource && !nextTarget) return edge;
+                return {
+                  ...edge,
+                  source: nextSource ?? edge.source,
+                  target: nextTarget ?? edge.target,
+                };
+              })
+            );
+          }
+
+          return merged.nodes as Node[];
+        });
       } catch {
         toast({ title: "Failed to load sheet", variant: "destructive" });
       } finally {
@@ -1291,15 +1407,44 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
       const res = await fetch(`/api/smartsheet/sheets/${sheetId}`);
       const sheet = await res.json();
       setSelectedSsSheet(sheet);
+      setSelectedSsSheetLoadedOnce(true);
       setSsConnected(true);
+      setNodes((prev) => {
+        const merged = mergeSmartsheetTargetNodes({
+          existingNodes: prev,
+          remoteColumns: (sheet.columns || []).map((col: SmartsheetColumn) => ({
+            id: Number(col.id),
+            title: String(col.title),
+            type: String(col.type),
+          })),
+          colRefForIndex: (index) => getColRef(index),
+          onLabelChange: handleLabelChange,
+          onTypeChange: handleTypeChange,
+        });
 
-      const ssNodes: Node[] = (sheet.columns || []).map((col: SmartsheetColumn, i: number) => ({
-        id: `ss_${col.id}`,
-        type: "ssCol",
-        position: { x: 800, y: 80 + i * 65 },
-        data: { label: col.title, colType: col.type, colId: col.id, colRef: "R" + getColRef(i), index: i, nodeId: `ss_${col.id}`, onLabelChange: handleLabelChange, onTypeChange: handleTypeChange, onDelete: handleDeleteNode },
-      }));
-      setNodes((prev) => [...prev.filter((n) => !n.id.startsWith("ss_")), ...ssNodes]);
+        if (merged.removedNodeIds.length > 0) {
+          setEdges((prevEdges) =>
+            prevEdges.filter((edge) => !merged.removedNodeIds.includes(String(edge.source)) && !merged.removedNodeIds.includes(String(edge.target)))
+          );
+        }
+
+        if (merged.remappedNodeIds.size > 0) {
+          setEdges((prevEdges) =>
+            prevEdges.map((edge) => {
+              const nextSource = merged.remappedNodeIds.get(String(edge.source));
+              const nextTarget = merged.remappedNodeIds.get(String(edge.target));
+              if (!nextSource && !nextTarget) return edge;
+              return {
+                ...edge,
+                source: nextSource ?? edge.source,
+                target: nextTarget ?? edge.target,
+              };
+            })
+          );
+        }
+
+        return merged.nodes as Node[];
+      });
     } catch {
       toast({ title: "Failed to load sheet", variant: "destructive" });
     } finally {
@@ -1638,15 +1783,10 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onEdgesDelete={handleEdgesDelete}
-            onNodesDelete={(deleted) => {
-              deleted.forEach((node) => {
-                handleDeleteNode(String(node.id));
-              });
-            }}
             onConnect={onConnect}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
-            deleteKeyCode={["Backspace", "Delete"]}
+            deleteKeyCode={null}
             fitView
             className="bg-slate-50"
             proOptions={{ hideAttribution: true }}
@@ -2110,6 +2250,10 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
                 onChange={(e) => {
                   const next = e.target.value;
                   setAddColumnName(next);
+                  setDuplicateTargetColumn((prev) => ({
+                    ...prev,
+                    duplicateNameTemplate: next,
+                  }));
                   if (addColumnSide === "right") {
                     setDynamicTargetColumn((prev) => ({
                       ...prev,
@@ -2126,6 +2270,41 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
                 <div className="flex items-center justify-between rounded border border-slate-200 bg-slate-50 px-2 py-1.5">
                   <span className="text-[11px] text-slate-600">Instant add to Smartsheet now</span>
                   <Switch checked={instantAddTargetColumn} onCheckedChange={setInstantAddTargetColumn} />
+                </div>
+              )}
+              {targetMode === "smartsheet" && !instantAddTargetColumn && (
+                <div className="space-y-2 rounded border border-slate-200 bg-slate-50 px-2 py-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-slate-600">Duplicate this column on every run</span>
+                    <Switch
+                      checked={duplicateTargetColumn.duplicateOnRun}
+                      onCheckedChange={(checked) =>
+                        setDuplicateTargetColumn((prev) => ({
+                          ...prev,
+                          duplicateOnRun: checked,
+                          duplicateNameTemplate: prev.duplicateNameTemplate || addColumnName,
+                        }))
+                      }
+                    />
+                  </div>
+                  {duplicateTargetColumn.duplicateOnRun && (
+                    <>
+                      <Input
+                        className="h-8 text-[11px]"
+                        value={duplicateTargetColumn.duplicateNameTemplate}
+                        onChange={(e) =>
+                          setDuplicateTargetColumn((prev) => ({
+                            ...prev,
+                            duplicateNameTemplate: e.target.value,
+                          }))
+                        }
+                        placeholder="e.g. Enrollments {{DATE}}"
+                      />
+                      <p className="text-[10px] text-slate-500">
+                        Use <code>{"{{DATE}}"}</code> (case-insensitive) to stamp each run date.
+                      </p>
+                    </>
+                  )}
                 </div>
               )}
               <p className="text-xs font-medium text-slate-600">Column position</p>

@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { getSheet, getSheetRows, type SmartsheetRow } from "@/lib/smartsheet";
 import { formatDynamicColumnName } from "@/lib/dynamic-column";
 import { assertEditAllowed, SecurityPolicyError } from "@/lib/security";
+import { collectDuplicateBaseLabels } from "@/lib/duplicationmech";
 
 interface RunOptions {
   hierarchyAware?: boolean;
@@ -194,15 +195,22 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
           })
         : "";
       const connectionNodes = ((currentVersion.connections as { nodes?: Array<{ type?: string; data?: Record<string, unknown> }> } | null)?.nodes ?? []);
+      const duplicateBaseLabels = collectDuplicateBaseLabels(connectionNodes);
+      const normalizeLabel = (value: unknown): string => String(value ?? "").trim().toLowerCase();
       const activeTargetLabels = new Set<string>();
       const activeTargetColumnIds = new Set<number>();
       connectionNodes
         .filter((n) => n.type === "ssCol")
         .forEach((n) => {
           const label = String(n.data?.label ?? "").trim();
+          const normalizedLabel = label.toLowerCase();
           const colId = Number(n.data?.colId ?? NaN);
           if (label) activeTargetLabels.add(label);
-          if (Number.isFinite(colId)) activeTargetColumnIds.add(colId);
+          if (label && duplicateBaseLabels.normalized.has(normalizedLabel)) {
+            // Duplicate-per-run targets are resolved at merge time to the newly created column.
+          } else if (Number.isFinite(colId)) {
+            activeTargetColumnIds.add(colId);
+          }
           if (label && Number.isFinite(colId)) targetLabelToColId.set(label, colId);
         });
       sheetMeta.columns.forEach((c) => {
@@ -334,6 +342,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
           if (!activeTargetLabels.has(normalizedColumn) && !(dynamicTargetColumnEnabled && normalizedColumn === dynamicTargetColumnLabel)) {
             return;
           }
+          const isDuplicateBaseColumn = duplicateBaseLabels.normalized.has(normalizeLabel(normalizedColumn));
           const columnId = targetLabelToColId.get(normalizedColumn) ?? null;
 
           if (!targetRow) {
@@ -353,18 +362,20 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
             return;
           }
 
-          const targetCell = typeof columnId === "number"
+          const targetCell = !isDuplicateBaseColumn && typeof columnId === "number"
             ? targetRow.cells.find((cell) => cell.columnId === columnId)
             : undefined;
-          const productionValue = targetCell?.value ?? null;
+          const productionValue = isDuplicateBaseColumn ? null : (targetCell?.value ?? null);
           const stagingValue = value ?? null;
           const left = productionValue === null || productionValue === undefined ? "" : String(productionValue).trim();
           const right = stagingValue === null || stagingValue === undefined ? "" : String(stagingValue).trim();
-          const changed = left !== right;
+          const changed = isDuplicateBaseColumn ? true : left !== right;
           if (!changed) return;
 
-          const cellHasFormula = typeof targetCell?.formula === "string" && targetCell.formula.trim() !== "";
-          const isLocked = Boolean(targetRow.locked || targetCell?.locked);
+          const cellHasFormula = isDuplicateBaseColumn
+            ? false
+            : (typeof targetCell?.formula === "string" && targetCell.formula.trim() !== "");
+          const isLocked = isDuplicateBaseColumn ? false : Boolean(targetRow.locked || targetCell?.locked);
           const shouldSkipForTopRow = options.skipTopRows > 0 && rowNumber > 0 && rowNumber <= options.skipTopRows;
           const shouldSkipForParentSummary = options.protectParentSummaryRows && targetRowIsParentSummary;
           const shouldSkipForFormula = options.protectFormulaCells && cellHasFormula;
@@ -427,6 +438,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         _dynamicTargetColumnResolvedName: dynamicTargetColumnEnabled ? dynamicTargetColumnLabel : null,
         _activeTargetLabels: Array.from(activeTargetLabels),
         _activeTargetColumnIds: Array.from(activeTargetColumnIds),
+        _duplicateBaseTargetLabels: Array.from(duplicateBaseLabels.raw),
         _rowPolicyDiagnostics: diagnostics,
         _rowPolicyApplied: {
           protectFormulaCells: options.protectFormulaCells,

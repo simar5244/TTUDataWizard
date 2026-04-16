@@ -6,6 +6,9 @@ import { prisma } from "@/lib/prisma";
 import { assertEditAllowed, SecurityPolicyError } from "@/lib/security";
 import { addSheetColumn, addSheetRows, deleteSheetColumn, getSheet, getSheetRows, updateSheetRows } from "@/lib/smartsheet";
 import { formatDynamicColumnName } from "@/lib/dynamic-column";
+import {
+  prepareDuplicateColumnsForRun,
+} from "@/lib/duplicationmech";
 
 interface DiffCell {
   row: number;
@@ -28,6 +31,17 @@ interface DynamicTargetColumnConfig {
   nameTemplate?: string;
   columnPosition?: "start" | "end" | "custom";
   customColumnNumber?: number;
+}
+
+interface MappingNodeData {
+  label?: string;
+  colType?: string;
+  colId?: string | number;
+  synthetic?: boolean;
+  columnPosition?: "start" | "end" | "custom";
+  customColumnNumber?: number;
+  duplicateOnRun?: boolean;
+  duplicateNameTemplate?: string;
 }
 
 export async function GET(req: NextRequest, { params }: { params: { id: string; runId: string } }) {
@@ -88,12 +102,14 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
 
   if (status === "merged") {
     const mapping = await prisma.mapping.findFirst({ where: { id: params.id, userId } });
-    if (!mapping?.smartsheetSheetId) {
+    const targetSheetId = String(mapping?.smartsheetSheetId ?? "");
+    if (!targetSheetId) {
       return NextResponse.json({ error: "Mapping is not connected to a Smartsheet target" }, { status: 400 });
     }
 
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { smartsheetToken: true } });
-    if (!user?.smartsheetToken) {
+    const smartsheetToken = String(user?.smartsheetToken ?? "");
+    if (!smartsheetToken) {
       return NextResponse.json({ error: "Smartsheet not connected" }, { status: 400 });
     }
 
@@ -101,8 +117,8 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
     appliedCellCount = cells.filter((c) => (c.resolution ?? "use_staging") !== "keep_production").length;
 
     const [sheetMeta, prodRows] = await Promise.all([
-      getSheet(user.smartsheetToken, mapping.smartsheetSheetId),
-      getSheetRows(user.smartsheetToken, mapping.smartsheetSheetId),
+      getSheet(smartsheetToken, targetSheetId),
+      getSheetRows(smartsheetToken, targetSheetId),
     ]);
 
     const colIdByTitle = new Map<string, number>();
@@ -145,6 +161,13 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
             .filter((value) => Number.isFinite(value))
         : []
     );
+    const duplicateBaseTargetLabels = new Set(
+      Array.isArray(stagingData?._duplicateBaseTargetLabels)
+        ? stagingData._duplicateBaseTargetLabels
+            .map((value) => String(value ?? "").trim())
+            .filter(Boolean)
+        : []
+    );
     const resolvedFromStaging = typeof stagingData?._dynamicTargetColumnResolvedName === "string"
       ? String(stagingData?._dynamicTargetColumnResolvedName)
       : "";
@@ -168,7 +191,7 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
           : position === "custom"
             ? Math.max(0, Math.min(sheetMeta.columns.length, customIndex))
             : sheetMeta.columns.length;
-      const created = await addSheetColumn(user.smartsheetToken, mapping.smartsheetSheetId, {
+      const created = await addSheetColumn(smartsheetToken, targetSheetId, {
         title: expectedDynamicColumnName,
         type: "TEXT_NUMBER",
         index: resolvedIndex,
@@ -178,21 +201,51 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
     }
 
     const mappingConnections = (mappingVersion?.connections ?? null) as {
-      nodes?: Array<{ id?: string; type?: string; data?: Record<string, unknown> }>;
+      nodes?: Array<{ id?: string; type?: string; data?: MappingNodeData }>;
       edges?: Array<Record<string, unknown>>;
       meta?: Record<string, unknown>;
     } | null;
     const latestNodes = Array.isArray(mappingConnections?.nodes) ? mappingConnections.nodes : [];
     const syntheticTargetColumnIds = new Map<string, number>();
+    const duplicatePreparation = await prepareDuplicateColumnsForRun({
+      nodes: latestNodes,
+      existingColumns: sheetMeta.columns.map((column) => ({
+        id: Number(column.id),
+        title: String(column.title),
+      })),
+      createColumn: async ({ title, type, index }) =>
+        addSheetColumn(smartsheetToken, targetSheetId, {
+          title,
+          type,
+          index,
+        }),
+      fetchColumns: async () => {
+        const refreshed = await getSheet(smartsheetToken, targetSheetId);
+        return refreshed.columns.map((column) => ({ id: Number(column.id), title: String(column.title) }));
+      },
+    });
+    const duplicateTargetColumnsByBaseLabel = duplicatePreparation.byBaseLabel;
+    const resolvedDuplicateTargetLabels = duplicatePreparation.resolvedLabels;
+    const refreshedTitleToId = duplicatePreparation.refreshedTitleToId;
+    const normalizeLabel = (value: unknown): string => String(value ?? "").trim().toLowerCase();
+    const duplicateTargetColumnsByNormalizedBaseLabel = new Map<string, { resolvedName: string; resolvedId?: number }>();
+    Array.from(duplicateTargetColumnsByBaseLabel.entries()).forEach(([baseLabel, target]) => {
+      const normalized = normalizeLabel(baseLabel);
+      if (!normalized) return;
+      duplicateTargetColumnsByNormalizedBaseLabel.set(normalized, target);
+    });
+    const normalizedActiveTargetLabels = new Set(Array.from(activeTargetLabels).map((label) => normalizeLabel(label)).filter(Boolean));
+    const normalizedResolvedDuplicateLabels = new Set(Array.from(resolvedDuplicateTargetLabels).map((label) => normalizeLabel(label)).filter(Boolean));
 
     for (let index = 0; index < latestNodes.length; index += 1) {
       const node = latestNodes[index];
       if (node?.type !== "ssCol") continue;
       const nodeData = node.data ?? {};
       const label = String(nodeData.label ?? "").trim();
+      const duplicateOnRun = nodeData.duplicateOnRun === true;
       const rawColId = nodeData.colId;
       const isSynthetic = nodeData.synthetic === true || (typeof rawColId === "string" && rawColId.startsWith("ss_manual_"));
-      if (!label || !isSynthetic) continue;
+      if (!label || !isSynthetic || duplicateOnRun) continue;
 
       const existingColId = colIdByTitle.get(label);
       if (existingColId) {
@@ -210,13 +263,21 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
           : syntheticPosition === "custom"
             ? Math.max(0, Math.min(sheetMeta.columns.length, syntheticCustomNumber - 1))
             : sheetMeta.columns.length;
-      const created = await addSheetColumn(user.smartsheetToken, mapping.smartsheetSheetId, {
+      const created = await addSheetColumn(smartsheetToken, targetSheetId, {
         title: label,
         type: typeof nodeData.colType === "string" && nodeData.colType ? String(nodeData.colType) : "TEXT_NUMBER",
         index: nodeIndex,
       });
       syntheticTargetColumnIds.set(label, created.id);
       colIdByTitle.set(label, created.id);
+    }
+
+    if (refreshedTitleToId.size > 0) {
+      colIdByTitle.clear();
+      Array.from(refreshedTitleToId.entries()).forEach(([title, id]) => {
+        if (!Number.isFinite(id)) return;
+        colIdByTitle.set(title, id);
+      });
     }
 
     const pendingDeletionColIds: number[] = [];
@@ -245,18 +306,51 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
       const rowIdx = Number(cell.row) - 1;
       if (rowIdx < 0) continue;
 
-      const cellColumnLabel = String(cell.column);
+      const cellColumnLabel = String(cell.column).trim();
+      const normalizedCellColumnLabel = normalizeLabel(cellColumnLabel);
+      const duplicateOverride =
+        duplicateTargetColumnsByBaseLabel.get(cellColumnLabel) ??
+        duplicateTargetColumnsByBaseLabel.get(String(cell.column)) ??
+        duplicateTargetColumnsByNormalizedBaseLabel.get(normalizedCellColumnLabel);
+      const effectiveColumnLabel = duplicateOverride?.resolvedName ?? cellColumnLabel;
+      const normalizedEffectiveColumnLabel = normalizeLabel(effectiveColumnLabel);
       const columnId =
+        duplicateOverride?.resolvedId ??
         syntheticTargetColumnIds.get(cellColumnLabel) ??
         (dynamicColumnEnabled && cellColumnLabel === expectedDynamicColumnName ? (dynamicColumnId ?? undefined) : undefined) ??
         (typeof cell.columnId === "number" && Number.isFinite(cell.columnId) ? cell.columnId : undefined) ??
+        colIdByTitle.get(effectiveColumnLabel) ??
         colIdByTitle.get(cellColumnLabel);
       if (!columnId) continue;
-      if (activeTargetLabels.size > 0 && !activeTargetLabels.has(cellColumnLabel) && cellColumnLabel !== expectedDynamicColumnName) {
+      const isResolvedDuplicateLabel =
+        resolvedDuplicateTargetLabels.has(effectiveColumnLabel) ||
+        normalizedResolvedDuplicateLabels.has(normalizedEffectiveColumnLabel);
+      if (
+        activeTargetLabels.size > 0 &&
+        !activeTargetLabels.has(cellColumnLabel) &&
+        !activeTargetLabels.has(effectiveColumnLabel) &&
+        !normalizedActiveTargetLabels.has(normalizedCellColumnLabel) &&
+        !normalizedActiveTargetLabels.has(normalizedEffectiveColumnLabel) &&
+        cellColumnLabel !== expectedDynamicColumnName &&
+        !isResolvedDuplicateLabel
+      ) {
         continue;
       }
-      const isTrackedByLabel = activeTargetLabels.has(cellColumnLabel) || cellColumnLabel === expectedDynamicColumnName;
-      if (activeTargetColumnIds.size > 0 && !isTrackedByLabel && !activeTargetColumnIds.has(columnId) && columnId !== dynamicColumnId) {
+      const isTrackedByLabel =
+        activeTargetLabels.has(cellColumnLabel) ||
+        activeTargetLabels.has(effectiveColumnLabel) ||
+        normalizedActiveTargetLabels.has(normalizedCellColumnLabel) ||
+        normalizedActiveTargetLabels.has(normalizedEffectiveColumnLabel) ||
+        cellColumnLabel === expectedDynamicColumnName ||
+        isResolvedDuplicateLabel;
+      const isDuplicateBaseLabel = duplicateBaseTargetLabels.has(cellColumnLabel) || duplicateBaseTargetLabels.has(effectiveColumnLabel);
+      if (
+        activeTargetColumnIds.size > 0 &&
+        !isTrackedByLabel &&
+        !isDuplicateBaseLabel &&
+        !activeTargetColumnIds.has(columnId) &&
+        columnId !== dynamicColumnId
+      ) {
         continue;
       }
 
@@ -289,7 +383,7 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
 
     const updates = Array.from(updatesByRow.values()).filter((r) => r.cells.length > 0);
     if (updates.length > 0) {
-      await updateSheetRows(user.smartsheetToken, mapping.smartsheetSheetId, updates);
+      await updateSheetRows(smartsheetToken, targetSheetId, updates);
     }
 
     const appends = Array.from(appendsByRowIndex.entries())
@@ -299,12 +393,12 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string; 
     appendedRowCount = appends.length;
 
     if (appends.length > 0) {
-      await addSheetRows(user.smartsheetToken, mapping.smartsheetSheetId, appends);
+      await addSheetRows(smartsheetToken, targetSheetId, appends);
     }
 
     for (const colId of pendingDeletionColIds) {
       try {
-        await deleteSheetColumn(user.smartsheetToken, mapping.smartsheetSheetId, colId);
+        await deleteSheetColumn(smartsheetToken, targetSheetId, colId);
       } catch {
         // no-op
       }
