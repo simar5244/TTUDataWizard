@@ -45,6 +45,8 @@ interface MappingVersion {
         customColumnNumber?: number;
       };
       targetMode?: "excel" | "smartsheet";
+      detailMappingEnabled?: boolean;
+      detailStore?: Record<string, { nodeId: string; ranges: { id: string; start: number; end: number }[] }>;
     };
   };
   formulas?: Record<string, string>;
@@ -346,26 +348,142 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
       return null;
     }
 
-    return sheet.data.map((row) => {
-      const outRow: Record<string, unknown> = {};
-      for (const tgtNode of targetNodes) {
-        const tgtLabel = (tgtNode.data.label as string) ?? "";
-        if (!tgtLabel) continue;
-        const inEdge = edges.find((e) => e.target === tgtNode.id);
-        if (!inEdge) continue;
-        outRow[tgtLabel] = resolveNodeValue(inEdge.source, row);
+    const detailEnabled = currentVersion?.connections?.meta?.detailMappingEnabled === true;
+    const detailStore = (currentVersion?.connections?.meta?.detailStore ?? {}) as Record<string, { nodeId: string; ranges: { id: string; start: number; end: number }[] }>;
+
+    // Determine whether any edges use range handles (r_xxx ids)
+    const isRangeHandleId = (h: string | undefined | null) => typeof h === "string" && h.startsWith("r_");
+    const hasRangeEdges = detailEnabled && edges.some(
+      (e) => isRangeHandleId(e.sourceHandle) || isRangeHandleId(e.targetHandle)
+    );
+
+    if (!hasRangeEdges) {
+      // --- Original behaviour: 1-to-1 row mapping ---
+      return sheet.data.map((row) => {
+        const outRow: Record<string, unknown> = {};
+        for (const tgtNode of targetNodes) {
+          const tgtLabel = (tgtNode.data.label as string) ?? "";
+          if (!tgtLabel) continue;
+          const inEdge = edges.find((e) => e.target === tgtNode.id);
+          if (!inEdge) continue;
+          outRow[tgtLabel] = resolveNodeValue(inEdge.source, row);
+        }
+        if (dynamicColEnabled && dynamicTargetLabel) {
+          let dynamicValue: unknown = null;
+          if (dynamicSourceNodeId) {
+            dynamicValue = resolveNodeValue(dynamicSourceNodeId, row);
+          } else if (dynamicSourceLabel) {
+            dynamicValue = row[dynamicSourceLabel] ?? null;
+          }
+          outRow[dynamicTargetLabel] = dynamicValue;
+        }
+        return outRow;
+      });
+    }
+
+    // --- Detailed mapping: range-aware output ---
+    // Helper: look up a range object by its id from detailStore
+    function findRangeById(rangeId: string): { start: number; end: number } | null {
+      for (const entry of Object.values(detailStore)) {
+        const r = entry.ranges.find((rr) => rr.id === rangeId);
+        if (r) return r;
       }
-      if (dynamicColEnabled && dynamicTargetLabel) {
+      return null;
+    }
+
+    // DEBUG — remove after diagnosis
+    console.log("[DetailMapping] detailEnabled:", detailEnabled);
+    console.log("[DetailMapping] detailStore:", JSON.stringify(detailStore, null, 2));
+    console.log("[DetailMapping] hasRangeEdges:", hasRangeEdges);
+    console.log("[DetailMapping] edges:", JSON.stringify(edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle, targetHandle: e.targetHandle })), null, 2));
+
+    // Determine output array size: max of target range ends, fallback to input length
+    let outputSize = sheet.data.length;
+    for (const edge of edges) {
+      if (isRangeHandleId(edge.targetHandle)) {
+        const r = findRangeById(edge.targetHandle!);
+        if (r && r.end > outputSize) outputSize = r.end;
+      }
+    }
+
+    // Build sparse output rows indexed 1-based (index 0 = output row 1)
+    const outRows: Record<string, unknown>[] = Array.from({ length: outputSize }, () => ({}));
+
+    for (const tgtNode of targetNodes) {
+      const tgtLabel = (tgtNode.data.label as string) ?? "";
+      if (!tgtLabel) continue;
+
+      // Collect all edges going to this target node
+      const inEdges = edges.filter((e) => e.target === tgtNode.id);
+
+      // Walk back through formula chains to find the deepest ranged source edge.
+      // This handles: excelCol[range] → formula → ssCol (the formula→ssCol edge
+      // itself has no range handle, but its upstream feed edge does).
+      const findUpstreamRange = (nodeId: string, directHandle: string | null | undefined): { start: number; end: number } | null => {
+        if (isRangeHandleId(directHandle)) return findRangeById(directHandle!);
+        const n = nodes.find((x) => x.id === nodeId);
+        if (!n || n.type !== "formula") return null;
+        for (const fe of edges.filter((fe) => fe.target === nodeId)) {
+          if (isRangeHandleId(fe.sourceHandle)) return findRangeById(fe.sourceHandle!);
+          const deeper = findUpstreamRange(fe.source, fe.sourceHandle);
+          if (deeper) return deeper;
+        }
+        return null;
+      };
+
+      for (const inEdge of inEdges) {
+        const srcHandle = inEdge.sourceHandle;
+        const tgtHandle = inEdge.targetHandle;
+
+        // Skip orphaned edges: handle id looks like a range id but was deleted from the store
+        if (isRangeHandleId(srcHandle) && !findRangeById(srcHandle!)) continue;
+        if (isRangeHandleId(tgtHandle) && !findRangeById(tgtHandle!)) continue;
+
+        const tgtIsRange = isRangeHandleId(tgtHandle);
+        // Walk the source side — handles direct range handles AND formula chains
+        const srcRange = findUpstreamRange(inEdge.source, srcHandle);
+        const tgtRange = tgtIsRange ? findRangeById(tgtHandle!) : null;
+
+        const isRangeEdge = srcRange !== null || tgtRange !== null;
+
+        if (isRangeEdge) {
+          const srcStart = srcRange ? srcRange.start : 1;
+          const srcEnd = srcRange ? srcRange.end : sheet.data.length;
+          const srcLen = srcEnd - srcStart + 1;
+          const dstStart = tgtRange ? tgtRange.start : 1;
+
+          for (let i = 0; i < srcLen; i++) {
+            const inputRowIdx = srcStart - 1 + i;
+            const outputRowIdx = dstStart - 1 + i;
+            const inputRow = sheet.data[inputRowIdx] as Record<string, string | number | boolean | null> | undefined;
+            if (!inputRow) continue;
+            if (outputRowIdx >= outRows.length) continue;
+            outRows[outputRowIdx][tgtLabel] = resolveNodeValue(inEdge.source, inputRow);
+          }
+        } else {
+          // Fully non-range edge — apply to all rows as normal
+          sheet.data.forEach((row, idx) => {
+            if (outRows[idx]) {
+              outRows[idx][tgtLabel] = resolveNodeValue(inEdge.source, row as Record<string, string | number | boolean | null>);
+            }
+          });
+        }
+      }
+    }
+
+    if (dynamicColEnabled && dynamicTargetLabel) {
+      sheet.data.forEach((row, idx) => {
         let dynamicValue: unknown = null;
         if (dynamicSourceNodeId) {
-          dynamicValue = resolveNodeValue(dynamicSourceNodeId, row);
+          dynamicValue = resolveNodeValue(dynamicSourceNodeId, row as Record<string, string | number | boolean | null>);
         } else if (dynamicSourceLabel) {
-          dynamicValue = row[dynamicSourceLabel] ?? null;
+          dynamicValue = (row as Record<string, unknown>)[dynamicSourceLabel] ?? null;
         }
-        outRow[dynamicTargetLabel] = dynamicValue;
-      }
-      return outRow;
-    });
+        if (outRows[idx]) outRows[idx][dynamicTargetLabel] = dynamicValue;
+      });
+    }
+
+    return outRows;
   }
 
   function isValueDifferent(a: unknown, b: unknown): boolean {

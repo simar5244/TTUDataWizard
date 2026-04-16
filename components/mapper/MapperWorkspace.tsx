@@ -50,6 +50,8 @@ import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { NodeActionsContext } from "@/components/mapper/NodeActionsContext";
 import { mergeSmartsheetTargetNodes } from "@/lib/duplicationmech";
+import { type DetailMappingStore, validateAllEdges } from "@/components/mapper/DetailView";
+import { DetailViewPanel } from "@/components/mapper/DetailViewPanel";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -261,6 +263,15 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
   const [targetMode, setTargetMode] = useState<TargetMode>("excel");
   const [mappingName, setMappingName] = useState(initialMapping?.name ?? "");
   const [autoPush, setAutoPush] = useState<boolean>(initialMapping?.autoPush ?? false);
+  const [detailMappingEnabled, setDetailMappingEnabled] = useState(false);
+  const [detailStore, setDetailStore] = useState<DetailMappingStore>({});
+  const [detailPanel, setDetailPanel] = useState<{
+    nodeId: string;
+    nodeLabel: string;
+    nodeType: "source" | "target";
+    x: number;
+    y: number;
+  } | null>(null);
   const [excelSheet, setExcelSheet] = useState<ExcelSheet | null>(null);
   const [sourceWorkbookSheets, setSourceWorkbookSheets] = useState<ExcelSheet[]>([]);
   const [excelTargetSheet, setExcelTargetSheet] = useState<ExcelSheet | null>(null);
@@ -356,6 +367,20 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
     setAutoPush(initialMapping?.autoPush ?? false);
   }, [initialMapping?.id, initialMapping?.autoPush]);
 
+  // Sync detailStore → node data.detailRanges so each node renders its per-range handles
+  useEffect(() => {
+    setNodes((nds) =>
+      nds.map((n) => {
+        if (n.type !== "excelCol" && n.type !== "ssCol") return n;
+        const ranges = detailMappingEnabled ? (detailStore[n.id]?.ranges ?? []) : [];
+        const current = (n.data?.detailRanges ?? []) as unknown[];
+        // Avoid triggering re-renders when nothing changed
+        if (JSON.stringify(current) === JSON.stringify(ranges)) return n;
+        return { ...n, data: { ...n.data, detailRanges: ranges } };
+      })
+    );
+  }, [detailStore, detailMappingEnabled, setNodes]);
+
   useEffect(() => {
     setSelectedSsSheetLoadedOnce(false);
   }, [initialMapping?.id]);
@@ -445,6 +470,11 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
     const savedExcelSheet = (conns as { meta?: { excelSheet?: unknown } } | undefined)?.meta?.excelSheet;
     if (savedExcelSheet && typeof savedExcelSheet === "object" && "columns" in savedExcelSheet) {
       setExcelSheet((prev) => prev ?? (savedExcelSheet as typeof excelSheet));
+    }
+    const metaAny = conns?.meta as Record<string, unknown> | undefined;
+    if (metaAny?.detailMappingEnabled === true) setDetailMappingEnabled(true);
+    if (metaAny?.detailStore && typeof metaAny.detailStore === "object") {
+      setDetailStore(metaAny.detailStore as DetailMappingStore);
     }
     if (!saved) return;
     const normalized: SmartsheetRowPolicy = {
@@ -1521,6 +1551,13 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
 
   async function handleSave() {
     if (!mappingName.trim()) { toast({ title: "Enter a mapping name", variant: "destructive" }); return; }
+    if (detailMappingEnabled) {
+      const errs = validateAllEdges(detailStore, edges.map((e) => ({ source: e.source, target: e.target, sourceHandle: e.sourceHandle, targetHandle: e.targetHandle })));
+      if (errs.length > 0) {
+        toast({ title: "Detailed Mapping — row count mismatch", description: errs.join("\n"), variant: "destructive" });
+        return;
+      }
+    }
     setSaving(true);
 
     const connections = {
@@ -1546,6 +1583,8 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
           ? { id: String(selectedSsSheet.id), name: selectedSsSheet.name }
           : undefined,
         excelSheet: excelSheet ?? undefined,
+        detailMappingEnabled,
+        detailStore,
       },
     };
     const formulas: Record<string, string> = {};
@@ -1588,24 +1627,28 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
     <NodeActionsContext.Provider value={{ deleteNode: handleDeleteNode }}>
     <div className="flex h-[calc(100vh-64px)] flex-col bg-slate-50">
       {/* Top bar */}
-      <div className="flex items-center gap-3 border-b border-slate-200 bg-white px-5 py-3 shadow-sm">
+      <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-5 py-3 shadow-sm">
         <Input
-          className="h-8 w-52 text-sm font-medium"
+          className="h-8 w-36 text-sm font-medium"
           placeholder="Mapping name…"
           value={mappingName}
           onChange={(e) => setMappingName(e.target.value)}
         />
         {initialMapping && (
           <Input
-            className="h-8 w-48 text-sm"
+            className="h-8 w-36 text-sm"
             placeholder="Change summary"
             value={changeSummary}
             onChange={(e) => setChangeSummary(e.target.value)}
           />
         )}
         <div className="flex items-center gap-2 rounded-md border border-slate-200 px-2 py-1">
-          <span className="text-xs font-medium text-slate-600">Auto Push</span>
+          <span className="whitespace-nowrap text-xs font-medium text-slate-600">Auto Push</span>
           <Switch checked={autoPush} onCheckedChange={setAutoPush} />
+        </div>
+        <div className={`flex items-center gap-2 rounded-md border px-2 py-1 transition-colors ${detailMappingEnabled ? "border-indigo-300 bg-indigo-50" : "border-slate-200"}`}>
+          <span className={`whitespace-nowrap text-xs font-medium ${detailMappingEnabled ? "text-indigo-700" : "text-slate-600"}`}>Detailed Mapping</span>
+          <Switch checked={detailMappingEnabled} onCheckedChange={(v) => { setDetailMappingEnabled(v); if (!v) setDetailPanel(null); }} />
         </div>
         <div className="ml-auto flex items-center gap-2">
           <FormulaReferenceDropdown />
@@ -1790,6 +1833,18 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
             fitView
             className="bg-slate-50"
             proOptions={{ hideAttribution: true }}
+            onNodeDoubleClick={(event, node) => {
+              if (!detailMappingEnabled) return;
+              if (node.type !== "excelCol" && node.type !== "ssCol") return;
+              const isTarget = node.type === "ssCol";
+              setDetailPanel({
+                nodeId: node.id,
+                nodeLabel: String(node.data?.label ?? node.id),
+                nodeType: isTarget ? "target" : "source",
+                x: event.clientX + 12,
+                y: event.clientY + 12,
+              });
+            }}
           >
             <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#cbd5e1" />
             <Controls 
@@ -1802,6 +1857,30 @@ export function MapperWorkspace({ initialMapping, onSaved }: MapperWorkspaceProp
             </Panel>
           </ReactFlow>
         </div>
+        {/* Detailed Mapping panel — rendered outside ReactFlow to avoid canvas event conflicts */}
+        {detailMappingEnabled && detailPanel && (
+          <DetailViewPanel
+            nodeId={detailPanel.nodeId}
+            nodeLabel={detailPanel.nodeLabel}
+            nodeType={detailPanel.nodeType}
+            store={detailStore}
+            onStoreChange={(nextStore) => {
+              // Collect all range ids still alive in the new store
+              const liveRangeIds = new Set<string>();
+              Object.values(nextStore).forEach((entry) => entry.ranges.forEach((r) => liveRangeIds.add(r.id)));
+              // Remove edges whose source or target handle points to a deleted range
+              setEdges((eds) => eds.filter((e) => {
+                if (e.sourceHandle?.startsWith("r_") && !liveRangeIds.has(e.sourceHandle)) return false;
+                if (e.targetHandle?.startsWith("r_") && !liveRangeIds.has(e.targetHandle)) return false;
+                return true;
+              }));
+              setDetailStore(nextStore);
+            }}
+            onClose={() => setDetailPanel(null)}
+            x={detailPanel.x}
+            y={detailPanel.y}
+          />
+        )}
 
         {/* Right panel - resize on left border */}
         <div

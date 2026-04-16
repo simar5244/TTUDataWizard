@@ -28,6 +28,8 @@ export interface MappingEdge {
   id: string;
   source: string;
   target: string;
+  sourceHandle?: string | null;
+  targetHandle?: string | null;
   data?: { formula?: string };
 }
 export interface MappingConnections {

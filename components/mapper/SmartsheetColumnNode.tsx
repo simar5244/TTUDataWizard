@@ -4,6 +4,7 @@ import { useEffect, useState, type MouseEvent } from "react";
 import { Handle, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import { Trash2 } from "lucide-react";
 import { useNodeActions } from "@/components/mapper/NodeActionsContext";
+import { type RowRange, rangeLabel } from "@/components/mapper/DetailView";
 
 const TYPE_COLORS: Record<string, string> = {
   TEXT_NUMBER: "bg-emerald-50 border-emerald-200 text-emerald-700",
@@ -16,14 +17,16 @@ const TYPE_COLORS: Record<string, string> = {
 export function SmartsheetColumnNode({ id, data, selected }: NodeProps) {
   const { deleteNode } = useNodeActions();
   const { deleteElements } = useReactFlow();
-  const { label, colType, colId, colRef, onLabelChange, onTypeChange } = data as {
+  const { label, colType, colId, colRef, onLabelChange, onTypeChange, detailRanges } = data as {
     label: string;
     colType: string;
     colId: number | string;
     colRef?: string;
     onLabelChange?: (nodeId: string, label: string) => void;
     onTypeChange?: (nodeId: string, type: string) => void;
+    detailRanges?: RowRange[];
   };
+  const hasRanges = Array.isArray(detailRanges) && detailRanges.length > 0;
   const [editing, setEditing] = useState(false);
   const [draftLabel, setDraftLabel] = useState(label);
 
@@ -53,7 +56,7 @@ export function SmartsheetColumnNode({ id, data, selected }: NodeProps) {
 
   return (
     <div
-      onDoubleClick={() => setEditing(true)}
+      onDoubleClick={() => { if (!hasRanges) setEditing(true); }}
       className={`group relative min-w-[170px] rounded-xl border-2 bg-white shadow-sm transition-all ${
         selected ? "border-emerald-500 ring-2 ring-emerald-100" : "border-slate-200"
       } hover:border-emerald-300`}
@@ -67,22 +70,25 @@ export function SmartsheetColumnNode({ id, data, selected }: NodeProps) {
       >
         <Trash2 className="h-2.5 w-2.5" />
       </button>
-      {/* Target handle - for receiving from formula output */}
-      <Handle
-        type="target"
-        position={Position.Left}
-        id={`in-${colId}`}
-        className="!h-3 !w-3 !border-2 !border-emerald-500 !bg-white transition-colors hover:!bg-emerald-500"
-        style={{ left: '-6px' }}
-      />
-      {/* Source handle - for sending to formula input */}
-      <Handle
-        type="source"
-        position={Position.Left}
-        id={`out-${colId}`}
-        className="!h-3 !w-3 !border-2 !border-emerald-500 !bg-white transition-colors hover:!bg-emerald-500"
-        style={{ left: '-6px' }}
-      />
+      {/* Default handles — visible only when no ranges are defined */}
+      {!hasRanges && (
+        <>
+          <Handle
+            type="target"
+            position={Position.Left}
+            id={`in-${colId}`}
+            className="!h-3 !w-3 !border-2 !border-emerald-500 !bg-white transition-colors hover:!bg-emerald-500"
+            style={{ left: '-6px' }}
+          />
+          <Handle
+            type="source"
+            position={Position.Left}
+            id={`out-${colId}`}
+            className="!h-3 !w-3 !border-2 !border-emerald-500 !bg-white transition-colors hover:!bg-emerald-500"
+            style={{ left: '-6px' }}
+          />
+        </>
+      )}
       <div className="px-3 py-2.5">
         <div className="flex items-center justify-between gap-2">
           {editing ? (
@@ -124,6 +130,23 @@ export function SmartsheetColumnNode({ id, data, selected }: NodeProps) {
         </div>
         {colRef && (
           <code className="mt-1 block text-[9px] text-emerald-600 font-mono">{colRef}</code>
+        )}
+        {/* Per-range rows with individual target handles on the left */}
+        {hasRanges && (
+          <div className="mt-2 flex flex-col gap-1 border-t border-slate-100 pt-1.5">
+            {detailRanges!.map((r) => (
+              <div key={r.id} className="relative flex items-center justify-between pl-5">
+                <Handle
+                  type="target"
+                  position={Position.Left}
+                  id={r.id}
+                  className="!absolute !-left-4 !h-2.5 !w-2.5 !border-2 !border-emerald-500 !bg-white transition-colors hover:!bg-emerald-500"
+                />
+                <span className="font-mono text-[10px] text-emerald-700">{rangeLabel(r)}</span>
+                <span className="text-[9px] text-slate-400">{r.end - r.start + 1}r</span>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>
