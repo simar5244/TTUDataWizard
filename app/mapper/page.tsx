@@ -15,6 +15,7 @@ export interface MappingNode {
   type: string;
   data: {
     label?: string;
+    sourceField?: string;
     colKey?: string;
     colId?: string;
     colRef?: string;
@@ -38,6 +39,21 @@ export interface MappingConnections {
       autoSkipParentRows?: boolean;
       excludedRowNumbers?: number[];
       excludedKeywords?: string[];
+    };
+    inputProcessing?: {
+      complexFormattingEnabled?: boolean;
+    };
+    workbookOptions?: {
+      inputSheetName?: string;
+      outputSheetName?: string;
+    };
+    dynamicTargetColumn?: {
+      enabled?: boolean;
+      sourceLabel?: string;
+      sourceNodeId?: string;
+      nameTemplate?: string;
+      columnPosition?: "start" | "end" | "custom";
+      customColumnNumber?: number;
     };
   };
 }

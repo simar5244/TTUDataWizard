@@ -1,7 +1,10 @@
 "use client";
 
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { useEffect, useState, type MouseEvent } from "react";
+import { Handle, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import { Badge } from "@/components/ui/badge";
+import { Trash2 } from "lucide-react";
+import { useNodeActions } from "@/components/mapper/NodeActionsContext";
 
 const TYPE_COLORS: Record<string, string> = {
   number: "bg-indigo-50 border-indigo-200 text-indigo-700",
@@ -11,29 +14,100 @@ const TYPE_COLORS: Record<string, string> = {
   empty: "bg-slate-50 border-slate-200 text-slate-600",
 };
 
-export function ExcelColumnNode({ data, selected }: NodeProps) {
-  const { label, dataType, sampleValues, colKey, colRef } = data as {
+export function ExcelColumnNode({ id, data, selected }: NodeProps) {
+  const { deleteNode } = useNodeActions();
+  const { deleteElements } = useReactFlow();
+  const { label, dataType, colKey, colRef, onLabelChange, onTypeChange } = data as {
     label: string;
     dataType: string;
-    sampleValues: unknown[];
     colKey: string;
     colRef?: string;
+    onLabelChange?: (nodeId: string, label: string) => void;
+    onTypeChange?: (nodeId: string, type: string) => void;
   };
+  const [editing, setEditing] = useState(false);
+  const [draftLabel, setDraftLabel] = useState(label);
+
+  useEffect(() => {
+    setDraftLabel(label);
+  }, [label]);
+
+  const nodeId = String(id || colKey || "");
+
+  function commitLabel() {
+    const trimmed = draftLabel.trim();
+    if (!trimmed || !onLabelChange || !nodeId) {
+      setEditing(false);
+      return;
+    }
+    onLabelChange(nodeId, trimmed);
+    setEditing(false);
+  }
+
+  async function handleDeleteClick(e: MouseEvent<HTMLButtonElement>) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!nodeId) return;
+    await deleteElements({ nodes: [{ id: nodeId }] });
+    deleteNode(nodeId);
+  }
 
   return (
     <div
-      className={`relative min-w-[170px] rounded-xl border-2 bg-white shadow-sm transition-all ${
+      onDoubleClick={() => setEditing(true)}
+      className={`group relative min-w-[170px] rounded-xl border-2 bg-white shadow-sm transition-all ${
         selected ? "border-indigo-500 ring-2 ring-indigo-100" : "border-slate-200"
       } hover:border-indigo-300`}
     >
+      <button
+        onClick={(e) => { void handleDeleteClick(e); }}
+        onMouseDown={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+        className="nodrag nopan absolute -right-2 -top-2 z-10 hidden h-4 w-4 items-center justify-center rounded-full bg-red-500 text-white shadow group-hover:flex"
+        title="Delete"
+      >
+        <Trash2 className="h-2.5 w-2.5" />
+      </button>
       <div className="px-3 py-2.5">
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate text-xs font-semibold text-slate-700">{label}</span>
+          {editing ? (
+            <input
+              value={draftLabel}
+              onChange={(e) => setDraftLabel(e.target.value)}
+              onBlur={commitLabel}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitLabel();
+                if (e.key === "Escape") {
+                  setDraftLabel(label);
+                  setEditing(false);
+                }
+              }}
+              autoFocus
+              className="h-6 w-full rounded border border-slate-200 px-1.5 text-xs font-semibold text-slate-700 outline-none"
+            />
+          ) : (
+            <span className="truncate text-xs font-semibold text-slate-700">{label}</span>
+          )}
           <Badge
             variant="outline"
             className={`shrink-0 text-[9px] capitalize ${TYPE_COLORS[dataType] || ""}`}
           >
-            {dataType}
+            {editing ? (
+              <select
+                value={dataType}
+                onChange={(e) => {
+                  if (!onTypeChange || !nodeId) return;
+                  onTypeChange(nodeId, e.target.value);
+                }}
+                className="bg-transparent text-[9px] outline-none"
+              >
+                <option value="string">string</option>
+                <option value="number">number</option>
+                <option value="date">date</option>
+                <option value="boolean">boolean</option>
+                <option value="empty">empty</option>
+              </select>
+            ) : dataType}
           </Badge>
         </div>
         {colRef && (

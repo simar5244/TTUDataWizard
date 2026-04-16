@@ -57,6 +57,9 @@ export const EXCEL_FORMULAS: ExcelFormula[] = [
   
   // Logic
   { name: 'IF', syntax: 'IF(condition, true, false)', description: 'Conditional', category: 'Logic', examples: ['IF(A>B, A, B)', 'IF(A>0, "Yes", "No")'] },
+  { name: 'IFNUMERIC', syntax: 'IFNUMERIC(value, true, false)', description: 'Branch when value is numeric', category: 'Logic', examples: ['IFNUMERIC(A, A, "")'] },
+  { name: 'IFDATE', syntax: 'IFDATE(value, true, false)', description: 'Branch when value is date-like', category: 'Logic', examples: ['IFDATE(A, A, "")'] },
+  { name: 'IFSTRING', syntax: 'IFSTRING(value, true, false)', description: 'Branch when value is plain text', category: 'Logic', examples: ['IFSTRING(A, A, "")'] },
   { name: 'AND', syntax: 'AND(A,B,...)', description: 'All true?', category: 'Logic', examples: ['AND(A>0, B>0)'] },
   { name: 'OR', syntax: 'OR(A,B,...)', description: 'Any true?', category: 'Logic', examples: ['OR(A>0, B>0)'] },
   { name: 'NOT', syntax: 'NOT(A)', description: 'Logical NOT', category: 'Logic', examples: ['NOT(A=B)'] },

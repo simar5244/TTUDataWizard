@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { getSheet, getSheetRows, type SmartsheetRow } from "@/lib/smartsheet";
+import { formatDynamicColumnName } from "@/lib/dynamic-column";
 import { assertEditAllowed, SecurityPolicyError } from "@/lib/security";
 
 interface RunOptions {
@@ -12,6 +13,16 @@ interface RunOptions {
   excludedRowPatterns?: string[];
   columnExcludedRowPatterns?: Record<string, string[]>;
   excludedRowNumbers?: number[];
+  skipTopRows?: number;
+}
+
+interface DynamicTargetColumnConfig {
+  enabled?: boolean;
+  sourceLabel?: string;
+  sourceNodeId?: string;
+  nameTemplate?: string;
+  columnPosition?: "start" | "end" | "custom";
+  customColumnNumber?: number;
 }
 
 interface DiffCell {
@@ -112,6 +123,10 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
               .filter((v: number) => Number.isFinite(v) && v > 0)
               .map((v: number) => Math.floor(v))
           : [],
+        skipTopRows:
+          typeof runOptions?.skipTopRows === "number" && runOptions.skipTopRows > 0
+            ? Math.floor(runOptions.skipTopRows)
+            : 0,
       };
 
       const rowById = new Map<number, SmartsheetRow>();
@@ -123,16 +138,14 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       });
 
       const titleColId = Number(sheetMeta.columns[0]?.id ?? NaN);
-      const columnFormulaById = new Map<number, string>();
-      sheetMeta.columns.forEach((col) => {
-        if (typeof col.formula === "string" && col.formula.trim() !== "") {
-          columnFormulaById.set(col.id, col.formula);
-        }
-      });
       const getRowTitle = (row: SmartsheetRow): string => {
         const titleCell = row.cells.find((cell) => cell.columnId === titleColId);
-        return String(titleCell?.displayValue ?? titleCell?.value ?? `Row ${row.rowNumber ?? ""}`)
-          .trim() || `Row ${row.rowNumber ?? ""}`;
+        const directTitle = String(titleCell?.displayValue ?? titleCell?.value ?? "").trim();
+        if (directTitle) return directTitle;
+        const fallbackTitle = row.cells
+          .map((cell) => String(cell.displayValue ?? cell.value ?? "").trim())
+          .find((value) => value !== "");
+        return fallbackTitle || `Row ${row.rowNumber ?? ""}`;
       };
 
       const getRowPath = (row: SmartsheetRow): string => {
@@ -155,35 +168,150 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       const formulaRowsDetected = prodRows.filter((r) => rowContainsFormula(r)).length;
       const hierarchyRowsDetected = prodRows.filter((r) => typeof r.parentId === "number").length;
 
-      // Parent/group-header detection should only be hierarchy-based.
-      // Formula-based protection is handled per-cell below (cellHasFormula).
       const isParentOrSummaryRow = (row: SmartsheetRow): boolean => parentIds.has(row.id);
 
       const mappedOutputRows = Array.isArray(outputRows)
         ? (outputRows as Record<string, unknown>[])
         : [];
 
+      const effectiveOutputRows = mappedOutputRows
+        .map((row, sourceIndex) => ({ row, sourceIndex }));
+
       const targetLabelToColId = new Map<string, number>();
+      const connMeta = (currentVersion.connections as {
+        meta?: { dynamicTargetColumn?: DynamicTargetColumnConfig };
+      } | null)?.meta;
+      const dynamicTargetCfg = connMeta?.dynamicTargetColumn;
+      const dynamicTargetColumnEnabled = dynamicTargetCfg?.enabled === true;
+      const dynamicTemplate = String(dynamicTargetCfg?.nameTemplate ?? "Enrollments {{DATE}}");
+      const dynamicBaseLabel = dynamicTargetColumnEnabled
+        ? formatDynamicColumnName(dynamicTemplate, { ensureUnique: false })
+        : "";
+      const dynamicTargetColumnLabel = dynamicTargetColumnEnabled
+        ? formatDynamicColumnName(dynamicTemplate, {
+            existingTitles: sheetMeta.columns.map((col) => col.title),
+            ensureUnique: true,
+          })
+        : "";
       const connectionNodes = ((currentVersion.connections as { nodes?: Array<{ type?: string; data?: Record<string, unknown> }> } | null)?.nodes ?? []);
+      const activeTargetLabels = new Set<string>();
+      const activeTargetColumnIds = new Set<number>();
       connectionNodes
         .filter((n) => n.type === "ssCol")
         .forEach((n) => {
           const label = String(n.data?.label ?? "").trim();
           const colId = Number(n.data?.colId ?? NaN);
+          if (label) activeTargetLabels.add(label);
+          if (Number.isFinite(colId)) activeTargetColumnIds.add(colId);
           if (label && Number.isFinite(colId)) targetLabelToColId.set(label, colId);
         });
       sheetMeta.columns.forEach((c) => {
         if (!targetLabelToColId.has(c.title)) targetLabelToColId.set(c.title, c.id);
       });
+      if (dynamicTargetColumnEnabled && dynamicTargetColumnLabel) {
+        activeTargetLabels.add(dynamicTargetColumnLabel);
+      }
+      console.log("[staging:dsp]", { dynamicTargetColumnEnabled, dynamicTargetColumnLabel, dynamicBaseLabel, firstOutputRowKeys: mappedOutputRows[0] ? Object.keys(mappedOutputRows[0]) : [] });
+
+      const shouldSkipTargetRowForAlignment = (row: SmartsheetRow): boolean => {
+        const rowNumber = row.rowNumber ?? 0;
+        if (options.skipTopRows > 0 && rowNumber > 0 && rowNumber <= options.skipTopRows) return true;
+        const targetRowIsParentSummary = isParentOrSummaryRow(row);
+        const targetRowTitle = getRowTitle(row);
+        const targetRowPath = getRowPath(row);
+        const isTopLevelFormulaRow = options.protectFormulaCells && typeof row.parentId !== "number" && rowContainsFormula(row);
+        const shouldSkipForExcludedPattern = options.excludedRowPatterns.some((pattern) => {
+          const p = pattern.trim().toLowerCase();
+          if (!p) return false;
+          return targetRowTitle.toLowerCase().includes(p) || targetRowPath.toLowerCase().includes(p);
+        });
+        const shouldSkipForExcludedRowNumber = options.excludedRowNumbers.includes(rowNumber);
+        const shouldSkipForParentSummary = options.protectParentSummaryRows && targetRowIsParentSummary;
+        return shouldSkipForParentSummary || shouldSkipForExcludedRowNumber || shouldSkipForExcludedPattern || isTopLevelFormulaRow;
+      };
+
+      const rowDebugSummary = prodRows.slice(0, 20).map((row) => {
+        const rowNumber = row.rowNumber ?? 0;
+        const title = getRowTitle(row);
+        const isParentSummary = isParentOrSummaryRow(row);
+        const hasFormula = rowContainsFormula(row);
+        const excludedByPattern = options.excludedRowPatterns.some((pattern) => {
+          const p = pattern.trim().toLowerCase();
+          if (!p) return false;
+          const path = getRowPath(row).toLowerCase();
+          return title.toLowerCase().includes(p) || path.includes(p);
+        });
+        return {
+          rowNumber,
+          rowId: row.id,
+          title,
+          parentId: row.parentId ?? null,
+          expanded: row.expanded ?? null,
+          isParentSummary,
+          hasFormula,
+          excludedByNumber: options.excludedRowNumbers.includes(rowNumber),
+          excludedByPattern,
+          skippedForAlignment: shouldSkipTargetRowForAlignment(row),
+        };
+      });
+      console.log("[staging] row classification", JSON.stringify({
+        totalOutputRows: mappedOutputRows.length,
+        totalProdRows: prodRows.length,
+        options,
+        firstRows: rowDebugSummary,
+      }));
+
+      const alignedTargetRows: Array<SmartsheetRow | null> = [];
+      let targetCursor = 0;
+      for (let sourceIndex = 0; sourceIndex < effectiveOutputRows.length; sourceIndex += 1) {
+        let matched: SmartsheetRow | null = null;
+        while (targetCursor < prodRows.length) {
+          const candidate = prodRows[targetCursor];
+          targetCursor += 1;
+          if (shouldSkipTargetRowForAlignment(candidate)) continue;
+          matched = candidate;
+          break;
+        }
+        alignedTargetRows.push(matched);
+      }
+
+      console.log("[staging] alignment preview", JSON.stringify(
+        effectiveOutputRows.slice(0, 20).map(({ row, sourceIndex }, outputIndex) => {
+          const targetRow = alignedTargetRows[outputIndex] ?? null;
+          const nonEmptyKeys = Object.entries(row)
+            .filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== "")
+            .map(([key]) => key)
+            .slice(0, 5);
+          return {
+            sourceIndex,
+            outputIndex,
+            sourceHasValues: nonEmptyKeys.length > 0,
+            nonEmptyKeys,
+            targetRowNumber: targetRow?.rowNumber ?? null,
+            targetRowId: targetRow?.id ?? null,
+            targetRowTitle: targetRow ? getRowTitle(targetRow) : null,
+            targetIsParentSummary: targetRow ? isParentOrSummaryRow(targetRow) : false,
+            targetHasFormula: targetRow ? rowContainsFormula(targetRow) : false,
+          };
+        })
+      ));
 
       const diffCells: DiffCell[] = [];
 
-      mappedOutputRows.forEach((outputRow, sourceIndex) => {
-        const targetRow = prodRows[sourceIndex];
+      effectiveOutputRows.forEach(({ row: outputRow, sourceIndex }, outputIndex) => {
+        const targetRow = alignedTargetRows[outputIndex] ?? null;
         const targetRowPath = targetRow ? getRowPath(targetRow) : null;
         const targetRowIsParentSummary = targetRow ? isParentOrSummaryRow(targetRow) : false;
         const targetRowTitle = targetRow ? getRowTitle(targetRow) : "";
         const rowNumber = targetRow?.rowNumber ?? sourceIndex + 1;
+        const normalizedOutputEntries = Object.entries(outputRow).map(([column, value]) => {
+          const normalizedColumn =
+            dynamicTargetColumnEnabled && (column === dynamicTargetColumnLabel || column === dynamicBaseLabel)
+              ? dynamicTargetColumnLabel
+              : column;
+          return [normalizedColumn, value] as const;
+        });
+        const normalizedOutputColumns = new Set(normalizedOutputEntries.map(([column]) => column));
         const matchesExcludedPattern = targetRow
           ? options.excludedRowPatterns.some((pattern) => {
               const p = pattern.trim().toLowerCase();
@@ -192,9 +320,21 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
             })
           : false;
 
-        Object.entries(outputRow).forEach(([column, value]) => {
-          const columnId = targetLabelToColId.get(column) ?? null;
-          if (!columnId) return;
+        const rowEntries = targetRow
+          ? [
+              ...normalizedOutputEntries,
+              ...Array.from(activeTargetLabels)
+                .filter((column) => !normalizedOutputColumns.has(column))
+                .filter((column) => !(dynamicTargetColumnEnabled && column === dynamicTargetColumnLabel))
+                .map((column) => [column, null] as const),
+            ]
+          : normalizedOutputEntries;
+
+        rowEntries.forEach(([normalizedColumn, value]) => {
+          if (!activeTargetLabels.has(normalizedColumn) && !(dynamicTargetColumnEnabled && normalizedColumn === dynamicTargetColumnLabel)) {
+            return;
+          }
+          const columnId = targetLabelToColId.get(normalizedColumn) ?? null;
 
           if (!targetRow) {
             diffCells.push({
@@ -202,7 +342,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
               rowId: null,
               rowPath: null,
               rowKind: "new_row",
-              column,
+              column: normalizedColumn,
               columnId,
               productionValue: null,
               stagingValue: value ?? null,
@@ -213,7 +353,9 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
             return;
           }
 
-          const targetCell = targetRow.cells.find((cell) => cell.columnId === columnId);
+          const targetCell = typeof columnId === "number"
+            ? targetRow.cells.find((cell) => cell.columnId === columnId)
+            : undefined;
           const productionValue = targetCell?.value ?? null;
           const stagingValue = value ?? null;
           const left = productionValue === null || productionValue === undefined ? "" : String(productionValue).trim();
@@ -221,15 +363,14 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
           const changed = left !== right;
           if (!changed) return;
 
-          const cellHasFormula =
-            (typeof targetCell?.formula === "string" && targetCell.formula.trim() !== "") ||
-            columnFormulaById.has(columnId);
+          const cellHasFormula = typeof targetCell?.formula === "string" && targetCell.formula.trim() !== "";
           const isLocked = Boolean(targetRow.locked || targetCell?.locked);
+          const shouldSkipForTopRow = options.skipTopRows > 0 && rowNumber > 0 && rowNumber <= options.skipTopRows;
           const shouldSkipForParentSummary = options.protectParentSummaryRows && targetRowIsParentSummary;
           const shouldSkipForFormula = options.protectFormulaCells && cellHasFormula;
           const shouldSkipForExcludedPattern = matchesExcludedPattern;
           const shouldSkipForExcludedRowNumber = options.excludedRowNumbers.includes(rowNumber);
-          const columnSpecificPatterns = options.columnExcludedRowPatterns[column] ?? [];
+          const columnSpecificPatterns = options.columnExcludedRowPatterns[normalizedColumn] ?? [];
           const shouldSkipForColumnPattern = columnSpecificPatterns.some((pattern) => {
             const p = String(pattern || "").trim().toLowerCase();
             if (!p) return false;
@@ -237,7 +378,8 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
           });
 
           let skipReason: DiffCell["skipReason"] | undefined;
-          if (shouldSkipForFormula) skipReason = "protected_formula";
+          if (shouldSkipForTopRow) skipReason = "excluded_by_rule";
+          else if (shouldSkipForFormula) skipReason = "protected_formula";
           else if (shouldSkipForParentSummary) skipReason = "protected_parent_summary";
           else if (shouldSkipForExcludedRowNumber) skipReason = "excluded_by_rule";
           else if (shouldSkipForExcludedPattern) skipReason = "excluded_by_rule";
@@ -249,7 +391,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
             rowId: targetRow.id,
             rowPath: targetRowPath,
             rowKind: targetRowIsParentSummary ? "parent_or_summary" : "detail",
-            column,
+            column: normalizedColumn,
             columnId,
             productionValue,
             stagingValue,
@@ -262,7 +404,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       });
 
       const diagnostics: RowPolicyDiagnostics = {
-        totalOutputRows: mappedOutputRows.length,
+        totalOutputRows: effectiveOutputRows.length,
         totalDiffCells: diffCells.length,
         skippedCells: diffCells.filter((c) => c.action === "skip").length,
         updatedCells: diffCells.filter((c) => c.action === "update").length,
@@ -282,6 +424,9 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       const existingStaging = (excelData && typeof excelData === "object" ? excelData : {}) as Record<string, unknown>;
       const enrichedStagingData = {
         ...existingStaging,
+        _dynamicTargetColumnResolvedName: dynamicTargetColumnEnabled ? dynamicTargetColumnLabel : null,
+        _activeTargetLabels: Array.from(activeTargetLabels),
+        _activeTargetColumnIds: Array.from(activeTargetColumnIds),
         _rowPolicyDiagnostics: diagnostics,
         _rowPolicyApplied: {
           protectFormulaCells: options.protectFormulaCells,
@@ -291,7 +436,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         },
       };
 
-      normalizedDiffResult = mappedOutputRows.length > 0 ? diffCells : applyResults || null;
+      normalizedDiffResult = effectiveOutputRows.length > 0 ? diffCells : applyResults || null;
       snapshotProduction = {
         rows: prodRows,
         diagnostics,

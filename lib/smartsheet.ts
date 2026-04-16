@@ -62,10 +62,10 @@ export async function listSheets(token: string): Promise<SmartsheetSheet[]> {
 export async function getSheet(token: string, sheetId: string): Promise<SmartsheetSheet> {
   const data = await ssRequest(token, `/sheets/${sheetId}`);
   return {
-    id: data.id,
+    id: Number(data.id),
     name: data.name,
     columns: (data.columns || []).map((c: Record<string, unknown>, i: number) => ({
-      id: c.id,
+      id: Number(c.id),
       title: c.title,
       type: c.type,
       index: i,
@@ -77,16 +77,16 @@ export async function getSheet(token: string, sheetId: string): Promise<Smartshe
 }
 
 export async function getSheetRows(token: string, sheetId: string): Promise<SmartsheetRow[]> {
-  const data = await ssRequest(token, `/sheets/${sheetId}`);
+  const data = await ssRequest(token, `/sheets/${sheetId}?include=formulas`);
   return (data.rows || []).map((r: Record<string, unknown>) => ({
-    id: r.id,
-    rowNumber: typeof r.rowNumber === "number" ? r.rowNumber : undefined,
-    parentId: typeof r.parentId === "number" ? r.parentId : undefined,
-    siblingId: typeof r.siblingId === "number" ? r.siblingId : undefined,
+    id: Number(r.id),
+    rowNumber: Number.isFinite(Number(r.rowNumber)) ? Number(r.rowNumber) : undefined,
+    parentId: Number.isFinite(Number(r.parentId)) ? Number(r.parentId) : undefined,
+    siblingId: Number.isFinite(Number(r.siblingId)) ? Number(r.siblingId) : undefined,
     expanded: typeof r.expanded === "boolean" ? r.expanded : undefined,
     locked: typeof r.locked === "boolean" ? r.locked : undefined,
     cells: ((r.cells as Record<string, unknown>[] | undefined) || []).map((c: Record<string, unknown>) => ({
-      columnId: c.columnId,
+      columnId: Number(c.columnId),
       value: c.value ?? null,
       displayValue: c.displayValue,
       formula: typeof c.formula === "string" ? c.formula : undefined,
@@ -134,6 +134,93 @@ export async function addSheetRows(
     method: "POST",
     body: JSON.stringify(rows),
   });
+}
+
+export async function addSheetColumn(
+  token: string,
+  sheetId: string,
+  column: { title: string; type?: string; index?: number }
+): Promise<SmartsheetColumn> {
+  const title = String(column.title ?? "").trim();
+  if (!title) {
+    throw new Error("Column title is required");
+  }
+
+  const payload: Record<string, unknown> = {
+    title,
+    type: column.type || "TEXT_NUMBER",
+  };
+  if (typeof column.index === "number" && Number.isFinite(column.index) && column.index >= 0) {
+    payload.index = Math.floor(column.index);
+  }
+
+  const data = await ssRequest(token, `/sheets/${sheetId}/columns`, {
+    method: "POST",
+    body: JSON.stringify([payload]),
+  });
+
+  const created =
+    (Array.isArray(data?.result) ? data.result[0] : null) ||
+    (Array.isArray(data?.data) ? data.data[0] : null) ||
+    data?.result ||
+    data;
+
+  return {
+    id: Number(created?.id),
+    title: String(created?.title ?? column.title),
+    type: String(created?.type ?? column.type ?? "TEXT_NUMBER"),
+    index: Number.isFinite(Number(created?.index)) ? Number(created.index) : (column.index ?? 0),
+    formula: typeof created?.formula === "string" ? created.formula : undefined,
+  };
+}
+
+export async function deleteSheetColumn(token: string, sheetId: string, columnId: number): Promise<void> {
+  await ssRequest(token, `/sheets/${sheetId}/columns/${columnId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function updateSheetColumn(
+  token: string,
+  sheetId: string,
+  columnId: number,
+  updates: { title?: string; type?: string; index?: number }
+): Promise<SmartsheetColumn> {
+  const payload: Record<string, unknown> = {};
+
+  if (typeof updates.title === "string") {
+    const title = updates.title.trim();
+    if (!title) {
+      throw new Error("Column title is required");
+    }
+    payload.title = title;
+  }
+
+  if (typeof updates.type === "string" && updates.type.trim() !== "") {
+    payload.type = updates.type.trim();
+  }
+
+  if (typeof updates.index === "number" && Number.isFinite(updates.index) && updates.index >= 0) {
+    payload.index = Math.floor(updates.index);
+  }
+
+  if (Object.keys(payload).length === 0) {
+    throw new Error("No column updates provided");
+  }
+
+  const data = await ssRequest(token, `/sheets/${sheetId}/columns/${columnId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+
+  const updated = data?.result ?? data;
+  return {
+    id: Number(updated?.id ?? columnId),
+    title: String(updated?.title ?? updates.title ?? ""),
+    type: String(updated?.type ?? updates.type ?? "TEXT_NUMBER"),
+    index: Number.isFinite(Number(updated?.index)) ? Number(updated.index) : 0,
+    formula: typeof updated?.formula === "string" ? updated.formula : undefined,
+  };
 }
 
 export async function validateToken(token: string): Promise<{ valid: boolean; name?: string; email?: string }> {

@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useCallback } from "react";
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { useState, useCallback, type MouseEvent } from "react";
+import { Handle, Position, useReactFlow, type NodeProps } from "@xyflow/react";
 import { Trash2, FunctionSquare, ArrowRight } from "lucide-react";
+import { useNodeActions } from "@/components/mapper/NodeActionsContext";
 
 // Formula templates with categories
 const MATH_TEMPLATES = [
@@ -78,6 +79,7 @@ function validateFormula(formula: string, inputs: { id: string; label: string; d
 
 interface FormulaNodeData {
   label?: string;
+  colRef?: string;
   formula: string;
   leftInputs: { id: string; label: string; colRef?: string }[];
   rightInputs: { id: string; label: string; colRef?: string }[];
@@ -87,14 +89,16 @@ interface FormulaNodeData {
 }
 
 export function FormulaNode({ id, data, selected }: NodeProps) {
+  const { deleteNode } = useNodeActions();
+  const { deleteElements } = useReactFlow();
   const nodeData = data as unknown as FormulaNodeData;
   const {
     label = "Formula",
+    colRef = "",
     formula = "",
     leftInputs = [],
     rightInputs = [],
     onFormulaChange,
-    onDelete,
     onLabelChange,
   } = nodeData;
 
@@ -107,6 +111,13 @@ export function FormulaNode({ id, data, selected }: NodeProps) {
     onLabelChange?.(id, draftLabel);
     setIsEditing(false);
   }, [id, draftFormula, draftLabel, onFormulaChange, onLabelChange]);
+
+  const handleDeleteClick = useCallback(async (e: MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    e.preventDefault();
+    await deleteElements({ nodes: [{ id: String(id) }] });
+    deleteNode(String(id));
+  }, [deleteElements, deleteNode, id]);
 
   const allInputs = [...leftInputs, ...rightInputs];
   const inputCount = allInputs.length;
@@ -148,13 +159,18 @@ export function FormulaNode({ id, data, selected }: NodeProps) {
 
       {/* Header */}
       <div className="flex items-center justify-between gap-2 border-b border-slate-100 bg-slate-50/50 px-3 py-2 rounded-t-xl">
-        <div className="flex items-center gap-1.5">
-          <FunctionSquare className="h-3.5 w-3.5 text-indigo-500" />
-          <span className="truncate text-xs font-semibold text-slate-700">{label}</span>
-        </div>
+          <div className="flex items-center gap-1.5">
+            <FunctionSquare className="h-3.5 w-3.5 text-indigo-500" />
+            <span className="truncate text-xs font-semibold text-slate-700">{label}</span>
+            {colRef && (
+              <code className="rounded bg-indigo-100 px-1 py-0.5 text-[9px] font-mono font-semibold text-indigo-700">{colRef}</code>
+            )}
+          </div>
         <button
-          onClick={() => onDelete?.(id)}
-          className="rounded p-0.5 opacity-0 hover:bg-red-50 group-hover:opacity-100"
+          onClick={(e) => { void handleDeleteClick(e); }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="nodrag nopan rounded p-0.5 opacity-0 hover:bg-red-50 group-hover:opacity-100"
           title="Delete"
         >
           <Trash2 className="h-3 w-3 text-red-400" />
@@ -253,12 +269,20 @@ export function FormulaNode({ id, data, selected }: NodeProps) {
         )}
       </div>
 
-      {/* Output handle */}
+      {/* Output handle - bottom (to ssCol) */}
       <Handle
         type="source"
         position={Position.Bottom}
         id="output"
         className="!h-4 !w-4 !-bottom-2 !border-2 !border-emerald-500 !bg-white hover:!bg-emerald-500"
+      />
+      {/* Output handle - right (to chain into another formula) */}
+      <Handle
+        type="source"
+        position={Position.Right}
+        id="output-right"
+        className="!h-3 !w-3 !border-2 !border-emerald-500 !bg-white hover:!bg-emerald-500"
+        style={{ right: '-6px', top: '50%' }}
       />
 
       {/* Output indicator */}

@@ -8,10 +8,12 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { parseExcelFile, validateExcelAgainstFingerprint, type SchemaFingerprint, type ExcelSheet } from "@/lib/excel";
+import { parseExcelFileComplex } from "@/lib/ComplexInput";
+import { evaluateFormula, indexToColRef } from "@/lib/formulas";
+import { formatDynamicColumnName } from "@/lib/dynamic-column";
 import { useToast } from "@/hooks/use-toast";
 import type { MappingConnections } from "@/app/mapper/page";
 import * as XLSX from "xlsx";
-import { evaluate } from "mathjs";
 
 interface MappingVersion {
   id: string;
@@ -25,6 +27,24 @@ interface MappingVersion {
         excludedRowNumbers?: number[];
         excludedKeywords?: string[];
       };
+      inputProcessing?: {
+        complexFormattingEnabled?: boolean;
+      };
+      workbookOptions?: {
+        inputSheetName?: string;
+        outputSheetName?: string;
+        excelNewSheetEnabled?: boolean;
+        excelNewSheetKeepExistingData?: boolean;
+      };
+      dynamicTargetColumn?: {
+        enabled?: boolean;
+        sourceLabel?: string;
+        sourceNodeId?: string;
+        nameTemplate?: string;
+        columnPosition?: "start" | "end" | "custom";
+        customColumnNumber?: number;
+      };
+      targetMode?: "excel" | "smartsheet";
     };
   };
   formulas?: Record<string, string>;
@@ -68,6 +88,13 @@ interface RunOptions {
   excludedRowPatterns: string[];
   columnExcludedRowPatterns: Record<string, string[]>;
   excludedRowNumbers: number[];
+  skipTopRows: number;
+}
+
+function toSheetName(raw: string, fallback: string): string {
+  const sanitized = raw.replace(/[\\/*?:\[\]]/g, " ").trim();
+  if (!sanitized) return fallback;
+  return sanitized.slice(0, 31);
 }
 
 export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogProps) {
@@ -86,10 +113,12 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
     excludedRowPatterns: ["total", "subtotal", "summary"],
     columnExcludedRowPatterns: {},
     excludedRowNumbers: [],
+    skipTopRows: 0,
   });
   const [excludedPatternInput, setExcludedPatternInput] = useState("total, subtotal, summary");
   const [excludedRowNumberInput, setExcludedRowNumberInput] = useState("");
   const [columnExclusionInput, setColumnExclusionInput] = useState("");
+  const [skipTopRowsInput, setSkipTopRowsInput] = useState("");
   const [lastPolicyDiagnostics, setLastPolicyDiagnostics] = useState<{
     totalOutputRows?: number;
     skippedCells?: number;
@@ -105,6 +134,9 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
   const fingerprint = currentVersion?.schemaFingerprint as SchemaFingerprint | undefined;
 
   const savedRowPolicy = currentVersion?.connections?.meta?.smartsheetRowPolicy;
+  const complexFormattingEnabled = currentVersion?.connections?.meta?.inputProcessing?.complexFormattingEnabled === true;
+  const workbookOptions = currentVersion?.connections?.meta?.workbookOptions;
+  const dynamicTargetColumn = currentVersion?.connections?.meta?.dynamicTargetColumn;
 
   useEffect(() => {
     const policy = savedRowPolicy;
@@ -134,7 +166,9 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
     setStep("validate");
 
     const buf = await f.arrayBuffer();
-    const parsed = parseExcelFile(buf, f.name, f.size);
+    const parsed = complexFormattingEnabled
+      ? parseExcelFileComplex(buf, f.name, f.size)
+      : parseExcelFile(buf, f.name, f.size);
     const sheet = parsed.sheets[0];
 
     if (!sheet) {
@@ -189,58 +223,146 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
 
     const nodes = conns.nodes ?? [];
     const edges = conns.edges ?? [];
-    const sourceNodes = nodes.filter((n) => n.type === "excelCol" || n.type === "ssCol");
     const targetNodes = nodes.filter((n) => n.type === "ssCol");
+    const formulaNodesOrdered = nodes
+      .filter((n) => n.type === "formula")
+      .slice()
+      .sort((a, b) => {
+        const aNum = Number(String(a.id).replace(/^formula_/, ""));
+        const bNum = Number(String(b.id).replace(/^formula_/, ""));
+        if (Number.isFinite(aNum) && Number.isFinite(bNum)) return aNum - bNum;
+        return String(a.id).localeCompare(String(b.id));
+      });
+    const formulaRefById = new Map<string, string>();
+    formulaNodesOrdered.forEach((node, index) => {
+      formulaRefById.set(String(node.id), `F${indexToColRef(index).toUpperCase()}`);
+    });
+    const dynamicColEnabled = dynamicTargetColumn?.enabled === true;
+    const dynamicSourceLabel = String(dynamicTargetColumn?.sourceLabel ?? "").trim();
+    const dynamicSourceNodeId = String(dynamicTargetColumn?.sourceNodeId ?? "").trim();
+    const dynamicTargetLabel = dynamicColEnabled
+      ? formatDynamicColumnName(String(dynamicTargetColumn?.nameTemplate ?? "Enrollments {{DATE}}"), {
+          ensureUnique: false,
+        })
+      : "";
 
-    function resolveNodeValue(nodeId: string): unknown {
+    function normalizeRuntimeValue(value: unknown): string | number | null {
+      if (value === null || value === undefined) return null;
+      if (typeof value === "number") return Number.isFinite(value) ? value : null;
+      if (typeof value === "boolean") return value ? 1 : 0;
+      const textValue = String(value);
+      const numeric = Number(textValue);
+      return Number.isFinite(numeric) && textValue.trim() !== "" ? numeric : textValue;
+    }
+
+    function resolveNodeValue(
+      nodeId: string,
+      row: Record<string, string | number | boolean | null>,
+      stack: Set<string> = new Set()
+    ): unknown {
+      if (stack.has(nodeId)) return null;
       const node = nodes.find((n) => n.id === nodeId);
       if (!node) return null;
-      if (node.type === "excelCol") return row[node.data.label ?? ""] ?? null;
+      if (node.type === "excelCol") {
+        const sourceField = String(node.data.sourceField ?? "").trim();
+        const label = String(node.data.label ?? "").trim();
+        if (sourceField && sourceField in row) return row[sourceField] ?? null;
+        if (label && label in row) return row[label] ?? null;
+        return null;
+      }
+      if (node.type === "ssCol") {
+        const inEdge = edges.find((e) => e.target === nodeId);
+        if (inEdge?.source) {
+          const nextStack = new Set(stack);
+          nextStack.add(nodeId);
+          return resolveNodeValue(inEdge.source, row, nextStack);
+        }
+        const sourceField = String(node.data.sourceField ?? "").trim();
+        const label = String(node.data.label ?? "").trim();
+        if (sourceField && sourceField in row) return row[sourceField] ?? null;
+        if (label && label in row) return row[label] ?? null;
+        return null;
+      }
       if (node.type === "formula") {
         const formula = (node.data.formula as string) || "";
         if (!formula) return null;
-        const scope: Record<string, unknown> = {};
-        sourceNodes.forEach((n) => {
-          const ref = (n.data.colRef as string) || "";
-          const label = (n.data.label as string) || "";
-          if (!ref || !label) return;
-          const value = row[label];
-          if (value === null || value === undefined || value === "") {
-            scope[ref] = 0;
-            return;
-          }
-          if (typeof value === "number") {
-            scope[ref] = value;
-            return;
-          }
-          const numeric = Number(value);
-          scope[ref] = Number.isFinite(numeric) && String(value).trim() !== "" ? numeric : String(value);
+        const runtimeContext: Record<string, string | number | null> = {};
+        const nextStack = new Set(stack);
+        nextStack.add(nodeId);
+        const incomingEdges = edges.filter((edge) => edge.target === nodeId);
+        const connectedInputs = [
+          ...(((node.data.leftInputs as { id: string; label: string; colRef?: string }[] | undefined) ?? []).map((input, index) => ({
+            ...input,
+            side: "left" as const,
+            handleId: `left-${index}`,
+          }))),
+          ...(((node.data.rightInputs as { id: string; label: string; colRef?: string }[] | undefined) ?? []).map((input, index) => ({
+            ...input,
+            side: "right" as const,
+            handleId: `right-${index}`,
+          }))),
+        ];
+
+        connectedInputs.forEach((input, index) => {
+          const matchingEdge = incomingEdges.find((edge) => {
+            const targetHandle = (edge as { targetHandle?: string }).targetHandle;
+            return edge.source === input.id && targetHandle === input.handleId;
+          })
+            ?? incomingEdges.find((edge) => edge.source === input.id);
+          const sourceNodeId = matchingEdge?.source ?? input.id;
+          const sourceNode = nodes.find((candidate) => candidate.id === sourceNodeId);
+          const resolvedValue = sourceNode
+            ? resolveNodeValue(sourceNode.id, row, nextStack)
+            : row[input.label] ?? null;
+          const normalizedValue = normalizeRuntimeValue(resolvedValue);
+          const explicitRef = String(input.colRef ?? sourceNode?.data?.colRef ?? "").trim();
+          const sourceFormulaRef = sourceNode ? formulaRefById.get(String(sourceNode.id)) : undefined;
+          const aliasRef = indexToColRef(index).toUpperCase();
+          if (explicitRef) runtimeContext[explicitRef] = normalizedValue;
+          if (sourceFormulaRef) runtimeContext[sourceFormulaRef] = normalizedValue;
+          runtimeContext[aliasRef] = normalizedValue;
         });
-        const normalized = formula.trim().replace(/^=/, "").replace(/\s*&\s*/g, " + ");
-        try {
-          const result = evaluate(normalized, scope);
-          if (result === undefined || result === null) return null;
-          if (typeof result === "number") {
-            return Number.isFinite(result) ? result : null;
-          }
-          return String(result);
-        } catch {
-          return null;
+
+        if (Object.keys(runtimeContext).length === 0) {
+          nodes
+            .filter((candidate) => candidate.type === "excelCol" || candidate.type === "ssCol")
+            .forEach((candidate) => {
+              const ref = String(candidate.data.colRef ?? "").trim();
+              const label = String(candidate.data.label ?? "").trim();
+              const sourceField = String(candidate.data.sourceField ?? "").trim();
+              const fieldName = sourceField || label;
+              if (!ref || !fieldName) return;
+              runtimeContext[ref] = normalizeRuntimeValue(row[fieldName]);
+            });
         }
+
+        const selfFormulaRef = formulaRefById.get(String(node.id));
+        if (selfFormulaRef && !(selfFormulaRef in runtimeContext)) {
+          runtimeContext[selfFormulaRef] = 0;
+        }
+
+        return evaluateFormula(formula, runtimeContext);
       }
       return null;
     }
 
-    let row: Record<string, string | number | boolean | null> = {};
-    return sheet.data.map((r) => {
-      row = r;
+    return sheet.data.map((row) => {
       const outRow: Record<string, unknown> = {};
       for (const tgtNode of targetNodes) {
         const tgtLabel = (tgtNode.data.label as string) ?? "";
         if (!tgtLabel) continue;
         const inEdge = edges.find((e) => e.target === tgtNode.id);
         if (!inEdge) continue;
-        outRow[tgtLabel] = resolveNodeValue(inEdge.source);
+        outRow[tgtLabel] = resolveNodeValue(inEdge.source, row);
+      }
+      if (dynamicColEnabled && dynamicTargetLabel) {
+        let dynamicValue: unknown = null;
+        if (dynamicSourceNodeId) {
+          dynamicValue = resolveNodeValue(dynamicSourceNodeId, row);
+        } else if (dynamicSourceLabel) {
+          dynamicValue = row[dynamicSourceLabel] ?? null;
+        }
+        outRow[dynamicTargetLabel] = dynamicValue;
       }
       return outRow;
     });
@@ -288,23 +410,51 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
     if (runMode === "excel_to_excel") {
       try {
         if (!parsedSheet) throw new Error("No sheet data");
-        const outputRows = outputPreviewRows.length ? outputPreviewRows : applyMappingToSheet(parsedSheet);
+        const mappedRows = outputPreviewRows.length ? outputPreviewRows : applyMappingToSheet(parsedSheet);
+        const outputRows = workbookOptions?.excelNewSheetEnabled
+          ? (() => {
+              const targetHeaders = ((currentVersion?.connections?.nodes ?? []) as Array<{ type?: string; data?: { label?: string } }>)
+                .filter((n) => n.type === "ssCol")
+                .map((n) => String(n.data?.label ?? "").trim())
+                .filter(Boolean);
+
+              const baseRows = (parsedSheet.data as Record<string, unknown>[]).map((row) => {
+                const base: Record<string, unknown> = {};
+                targetHeaders.forEach((header) => {
+                  base[header] = workbookOptions?.excelNewSheetKeepExistingData ? row[header] ?? null : null;
+                });
+                return base;
+              });
+
+              return mappedRows.map((row, idx) => ({ ...(baseRows[idx] ?? {}), ...row }));
+            })()
+          : mappedRows;
         const preview = changePreview ?? buildChangePreview(parsedSheet.data as Record<string, unknown>[], outputRows);
 
         const wb = XLSX.utils.book_new();
-        const ws = XLSX.utils.json_to_sheet(outputRows);
-        XLSX.utils.book_append_sheet(wb, ws, "Mapped");
+        const outputSheetName = toSheetName(String(workbookOptions?.outputSheetName ?? "Mapped"), "Mapped");
+        const sourceSheetName = toSheetName(String(workbookOptions?.inputSheetName ?? "Source"), "Source");
+
+        const outputWs = XLSX.utils.json_to_sheet(outputRows);
+        XLSX.utils.book_append_sheet(wb, outputWs, outputSheetName);
+
+        if ((parsedSheet?.data?.length ?? 0) > 0) {
+          const inputWs = XLSX.utils.json_to_sheet(parsedSheet?.data ?? []);
+          const inputName = sourceSheetName === outputSheetName ? `${sourceSheetName.slice(0, 28)}_in` : sourceSheetName;
+          XLSX.utils.book_append_sheet(wb, inputWs, inputName);
+        }
+
         const outName = `${mapping.name.replace(/\s+/g, "_")}_mapped.xlsx`;
         XLSX.writeFile(wb, outName);
 
         // Save the run to database
-        const currentVersion = mapping.versions.find((v) => v.id === mapping.currentVersionId) ?? mapping.versions.at(-1);
-        if (currentVersion) {
+        const versionForRun = mapping.versions.find((v) => v.id === mapping.currentVersionId) ?? mapping.versions.at(-1);
+        if (versionForRun) {
           const saveRunRes = await fetch(`/api/mappings/${mapping.id}/runs`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              mappingVersionId: currentVersion.id,
+              mappingVersionId: versionForRun.id,
               direction: "excel_to_excel",
               inputFileName: file.name,
               inputData: parsedSheet.data,
@@ -417,10 +567,12 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
       excludedRowPatterns: ["total", "subtotal", "summary"],
       columnExcludedRowPatterns: {},
       excludedRowNumbers: [],
+      skipTopRows: 0,
     });
     setExcludedPatternInput("total, subtotal, summary");
     setExcludedRowNumberInput("");
     setColumnExclusionInput("");
+    setSkipTopRowsInput("");
   }
 
   return (
@@ -440,16 +592,22 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
         </div>
 
         {step === "upload" && (
-          <div
-            {...getRootProps()}
-            className={`flex flex-col items-center justify-center rounded-lg border-2 border-dashed p-10 text-center cursor-pointer transition-colors ${
-              isDragActive ? "border-black bg-[#F5F5F5]" : "border-[#E5E5E5] hover:border-[#A1A1A1]"
-            }`}
-          >
-            <input {...getInputProps()} />
-            <Upload className="mb-3 h-8 w-8 text-[#A1A1A1]" />
-            <p className="text-sm font-medium">Drop your source Excel file here</p>
-            <p className="mt-1 text-xs text-[#6B6B6B]">or click to browse — .xlsx, .xls, .csv</p>
+          <div className="space-y-3">
+            <div
+              {...getRootProps()}
+              className={`flex flex-col items-center justify-center rounded-lg border-2 border-dashed p-10 text-center cursor-pointer transition-colors ${
+                isDragActive ? "border-black bg-[#F5F5F5]" : "border-[#E5E5E5] hover:border-[#A1A1A1]"
+              }`}
+            >
+              <input {...getInputProps()} />
+              <Upload className="mb-3 h-8 w-8 text-[#A1A1A1]" />
+              <p className="text-sm font-medium">Drop your source Excel file here</p>
+              <p className="mt-1 text-xs text-[#6B6B6B]">or click to browse — .xlsx, .xls, .csv</p>
+            </div>
+            <div className="flex items-center justify-between rounded-lg border border-[#E5E5E5] bg-[#F9F9F9] px-3 py-2">
+              <span className="text-xs text-[#6B6B6B]">Complex formatting</span>
+              <Switch checked={complexFormattingEnabled} disabled />
+            </div>
           </div>
         )}
 
@@ -594,6 +752,22 @@ export function RunMappingDialog({ mapping, open, onClose }: RunMappingDialogPro
                     <Switch
                       checked={runOptions.protectParentSummaryRows}
                       onCheckedChange={(checked) => setRunOptions((prev) => ({ ...prev, protectParentSummaryRows: checked }))}
+                    />
+                  </div>
+                  <div className="space-y-2 rounded-md border border-[#EFEFEF] px-3 py-2">
+                    <p className="text-xs font-medium">Skip top N rows</p>
+                    <p className="text-[11px] text-[#6B6B6B]">Always skip the first N rows of the destination sheet (e.g. 2 for two header/formula rows at the top).</p>
+                    <Input
+                      value={skipTopRowsInput}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value;
+                        setSkipTopRowsInput(raw);
+                        const n = Math.max(0, Math.floor(Number(raw)));
+                        setRunOptions((prev) => ({ ...prev, skipTopRows: Number.isFinite(n) ? n : 0 }));
+                      }}
+                      placeholder="2"
+                      type="number"
+                      min="0"
                     />
                   </div>
                   <div className="space-y-2 rounded-md border border-[#EFEFEF] px-3 py-2">
